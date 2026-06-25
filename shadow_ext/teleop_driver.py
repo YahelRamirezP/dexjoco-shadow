@@ -31,10 +31,10 @@ from dexjoco.sim.controllers import opspace
 
 from .build import build_spec
 from .mapping import build_finger_map, qpos_to_ctrl
+from .tasks import REGISTRY
 
 # Panda home (identical to the Allegro env so the arm starts in a known pose).
 _PANDA_HOME = np.asarray((0, -0.785, 0, -2.35, 0, 1.57, np.pi / 4))
-_LIFT_THRESH = 0.05  # m, object considered grasped+lifted above its start z
 
 # Hand-tuned close target, per Shadow finger joint (placeholder for retargeter).
 # Coupled distal pair J2,J1 each set here; the map sums them into A_*J0.
@@ -64,8 +64,9 @@ def _panda_ids(model):
     return dof, ctrl
 
 
-def run(view: bool = False, n_steps: int = 1500):
-    model = build_spec("arena_arm_hand_bucket_pick.xml").compile()
+def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int = 1500):
+    task = REGISTRY[task_name]
+    model = build_spec(task.arena).compile()
     data = mujoco.MjData(model)
 
     panda_dof, panda_ctrl = _panda_ids(model)
@@ -79,21 +80,13 @@ def run(view: bool = False, n_steps: int = 1500):
     data.mocap_pos[0] = data.sensor("franka/flange_pos").data.copy()
     data.mocap_quat[0] = data.sensor("franka/flange_quat").data.copy()
 
-    food_z0 = float(data.sensor("boxed_food_0_pos").data[2])
-
     # Finger close target, mapped 24 joints -> 20 ctrl, clipped to actuator range.
     q_target = finger_target_qpos(model)
     ctrl_close = np.clip(qpos_to_ctrl(q_target, fing_ids, fing_plan),
                          fing_ctrlrange[:, 0], fing_ctrlrange[:, 1])
 
-    bucket_site_ids = [model.site(f"bucket_ref_{i}").id for i in range(8)]
-
-    def metrics():
-        food = np.asarray(data.sensor("boxed_food_0_pos").data, float)
-        lifted = (food[2] - food_z0) >= _LIFT_THRESH
-        corners = np.asarray(data.site_xpos[bucket_site_ids], float)
-        inside = np.all(food >= corners.min(0)) and np.all(food <= corners.max(0))
-        return bool(lifted), bool(inside and lifted)
+    task.reset()
+    succeeded = False
 
     viewer = mujoco.viewer.launch_passive(model, data) if view else None
     try:
@@ -111,20 +104,21 @@ def run(view: bool = False, n_steps: int = 1500):
             data.ctrl[panda_ctrl] = tau
 
             mujoco.mj_step(model, data)
+            succeeded = task.update(model, data) or succeeded
             if viewer is not None:
                 viewer.sync()
     finally:
         if viewer is not None:
             viewer.close()
 
-    grasp_lift, bucket_place = metrics()
-    print(f"steps={n_steps}")
-    print(f"grasp_lift   (object lifted >= {_LIFT_THRESH}m): {grasp_lift}")
-    print(f"bucket_place (in bucket + lifted, needs stage3): {bucket_place}")
-    return grasp_lift, bucket_place
+    print(f"task={task_name} steps={n_steps}")
+    print(f"succeed (DexJoCo metric): {succeeded}")
+    return succeeded
 
 
 if __name__ == "__main__":
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    task_name = args[0] if args else "pick_bucket"
     if "--view" in sys.argv:
         import mujoco.viewer  # noqa: F401
-    run(view="--view" in sys.argv)
+    run(task_name=task_name, view="--view" in sys.argv)
