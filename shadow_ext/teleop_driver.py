@@ -32,6 +32,7 @@ from dexjoco.sim.controllers import opspace
 from .build import build_spec
 from .mapping import build_finger_map, qpos_to_ctrl
 from .tasks import REGISTRY
+from .recorder import Recorder
 
 # Panda home (identical to the Allegro env so the arm starts in a known pose).
 _PANDA_HOME = np.asarray((0, -0.785, 0, -2.35, 0, 1.57, np.pi / 4))
@@ -64,10 +65,13 @@ def _panda_ids(model):
     return dof, ctrl
 
 
-def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int = 1500):
+def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int = 1500,
+        record: str | None = None, shot: str | None = None, cam: str = "front"):
     task = REGISTRY[task_name]
     model = build_spec(task.arena).compile()
     data = mujoco.MjData(model)
+
+    rec = Recorder(model, cam=cam) if (record or shot) else None
 
     panda_dof, panda_ctrl = _panda_ids(model)
     site_id = (model.site("attachment_site") or model.site("attachment_site_right")).id
@@ -105,20 +109,57 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int = 1500)
 
             mujoco.mj_step(model, data)
             succeeded = task.update(model, data) or succeeded
+            if rec is not None and record:
+                rec.maybe_capture(data, k)
             if viewer is not None:
                 viewer.sync()
     finally:
         if viewer is not None:
             viewer.close()
 
+    if rec is not None:
+        if shot:
+            rec.shot(data, shot)
+            print(f"shot saved: {shot}")
+        if record:
+            rec.save_video(record)
+            print(f"video saved: {record}")
+        rec.close()
+
     print(f"task={task_name} steps={n_steps}")
     print(f"succeed (DexJoCo metric): {succeeded}")
     return succeeded
 
 
+_VALUE_FLAGS = ("--record", "--shot", "--cam")
+
+
+def _parse(argv):
+    """Return (positionals, flags_with_values). --view is a bare flag."""
+    pos, flags, i = [], {}, 0
+    while i < len(argv):
+        a = argv[i]
+        if a in _VALUE_FLAGS and i + 1 < len(argv):
+            flags[a] = argv[i + 1]
+            i += 2
+        elif a.startswith("--"):
+            flags[a] = True
+            i += 1
+        else:
+            pos.append(a)
+            i += 1
+    return pos, flags
+
+
 if __name__ == "__main__":
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    task_name = args[0] if args else "pick_bucket"
-    if "--view" in sys.argv:
+    pos, flags = _parse(sys.argv[1:])
+    task_name = pos[0] if pos else "pick_bucket"
+    if "--view" in flags:
         import mujoco.viewer  # noqa: F401
-    run(task_name=task_name, view="--view" in sys.argv)
+    run(
+        task_name=task_name,
+        view="--view" in flags,
+        record=flags.get("--record"),
+        shot=flags.get("--shot"),
+        cam=flags.get("--cam", "front"),
+    )
