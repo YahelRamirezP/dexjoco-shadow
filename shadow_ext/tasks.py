@@ -126,11 +126,91 @@ class PinchTongs(_Task):
         return self._success_counter >= self._STEPS_REQUIRED
 
 
-# Registry. hammer_nail pending: its _nail_depth is env-internal physics
-# (computed in step), not a pure read -> needs the nail-drive block copied or a
-# task swap (e.g. click_mouse / fold_glasses).
+class HammerNail(_Task):
+    """Copy of panda_hammer_nail_env nail-drive physics + success.
+    The nail is a mocap body driven DOWN on each valid hammer impact (this task
+    WRITES data.mocap_pos[nail], unlike the read-only tasks). Success = nail
+    depth >= 0.04m. Defaults copied from the env __init__.
+
+    Impact model (env lines 555-651): track the hammer 'face' geom z-velocity in
+    a 12-sample buffer; on a hammer<->nail contact, if the pre-impact downward
+    velocity exceeds the threshold, advance depth by impact_step*speed_scale."""
+    arena = "arena_arm_hand_hammer_nail.xml"
+    name = "hammer_nail"
+    _SUCCESS_DEPTH = 0.04
+    _IMPACT_STEP = 0.008
+    _VEL_THRESH = 0.02
+    _MAX_DEPTH = 0.0726
+
+    def reset(self):
+        self._init = False
+        self._nail_depth = 0.0
+        self._prev_face_z = None
+        self._vz_buf = []
+
+    def _setup(self, model, data):
+        nail_body = model.body("nail")
+        self._nail_mocap_id = int(nail_body.mocapid[0])
+        self._nail_init_pos = model.body_pos[nail_body.id].copy()
+        self._nail_init_quat = model.body_quat[nail_body.id].copy()
+        self._hammer_gids = {model.geom(n).id for n in ("face", "head", "neck", "claw")
+                             if _has_geom(model, n)}
+        self._nail_gids = {model.geom(n).id for n in ("nail_head", "nail_shaft")
+                           if _has_geom(model, n)}
+        self._face_gid = model.geom("face").id if _has_geom(model, "face") else -1
+        self._dt = float(model.opt.timestep)
+        self._init = True
+
+    def update(self, model, data) -> bool:
+        if not self._init:
+            self._setup(model, data)
+
+        # track hammer-face z velocity (12-sample buffer)
+        if self._face_gid >= 0:
+            face_z = float(data.geom_xpos[self._face_gid][2])
+            if self._prev_face_z is None:
+                self._prev_face_z = face_z
+            self._vz_buf.append((face_z - self._prev_face_z) / self._dt)
+            self._prev_face_z = face_z
+            if len(self._vz_buf) > 12:
+                self._vz_buf.pop(0)
+
+        # contact scan: any hammer geom touching any nail geom
+        hit = False
+        for i in range(int(data.ncon)):
+            c = data.contact[i]
+            g1, g2 = int(c.geom1), int(c.geom2)
+            if (g1 in self._hammer_gids and g2 in self._nail_gids) or \
+               (g2 in self._hammer_gids and g1 in self._nail_gids):
+                hit = True
+                break
+
+        if hit:
+            preimpact_vz = min(self._vz_buf) if self._vz_buf else 0.0
+            if preimpact_vz < -self._VEL_THRESH:
+                scale = min(3.0, abs(preimpact_vz) / max(self._VEL_THRESH, 1e-6))
+                new_depth = min(self._MAX_DEPTH, self._nail_depth + self._IMPACT_STEP * scale)
+                if new_depth > self._nail_depth:
+                    self._nail_depth = new_depth
+                    pos = self._nail_init_pos.copy()
+                    pos[2] = self._nail_init_pos[2] - new_depth
+                    data.mocap_pos[self._nail_mocap_id] = pos
+                    data.mocap_quat[self._nail_mocap_id] = self._nail_init_quat
+
+        return self._nail_depth >= self._SUCCESS_DEPTH
+
+
+def _has_geom(model, name) -> bool:
+    try:
+        model.geom(name)
+        return True
+    except Exception:
+        return False
+
+
 REGISTRY: dict[str, _Task] = {
     "pick_bucket": PickBucket(),
     "water_plant": WaterPlant(),
     "pinch_tongs": PinchTongs(),
+    "hammer_nail": HammerNail(),
 }

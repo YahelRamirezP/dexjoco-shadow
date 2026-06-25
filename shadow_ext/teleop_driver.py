@@ -75,14 +75,17 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int = 1500,
 
     panda_dof, panda_ctrl = _panda_ids(model)
     site_id = (model.site("attachment_site") or model.site("attachment_site_right")).id
+    # Panda wrist target mocap, resolved BY NAME (not index 0): hammer scenes have
+    # a second mocap (the nail) that may sit at index 0.
+    mocap = int(model.body("target").mocapid[0])
     fing_ids, fing_plan = build_finger_map(model)
     fing_ctrlrange = model.actuator_ctrlrange[fing_ids].copy()
 
     # Home the arm, settle, then weld the wrist target to the current flange pose.
     data.qpos[panda_dof] = _PANDA_HOME
     mujoco.mj_forward(model, data)
-    data.mocap_pos[0] = data.sensor("franka/flange_pos").data.copy()
-    data.mocap_quat[0] = data.sensor("franka/flange_quat").data.copy()
+    data.mocap_pos[mocap] = data.sensor("franka/flange_pos").data.copy()
+    data.mocap_quat[mocap] = data.sensor("franka/flange_quat").data.copy()
 
     # Finger close target, mapped 24 joints -> 20 ctrl, clipped to actuator range.
     q_target = finger_target_qpos(model)
@@ -102,7 +105,7 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int = 1500,
             # Arm: OSC hold at the fixed wrist target (stage 1 = no wrist motion).
             tau = opspace(
                 model=model, data=data, site_id=site_id, dof_ids=panda_dof,
-                pos=data.mocap_pos[0], ori=data.mocap_quat[0], joint=_PANDA_HOME,
+                pos=data.mocap_pos[mocap], ori=data.mocap_quat[mocap], joint=_PANDA_HOME,
                 gravity_comp=True, pos_gains=(400.0, 400.0, 400.0), damping_ratio=4,
             )
             data.ctrl[panda_ctrl] = tau
