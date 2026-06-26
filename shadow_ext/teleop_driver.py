@@ -48,6 +48,30 @@ _SHADOW_24_ORDER = (
     "THJ5", "THJ4", "THJ3", "THJ2", "THJ1",
 )
 _FINGER_UDP_PORT = 5014   # matches sim_teleop hand port (right hand)
+_WRIST_UDP_PORT = 5012    # matches sim_teleop VIVE/wrist port
+_WRIST_POSE_SCALE = 1.0   # delta-translation gain (sim_teleop uses 1.5 for VIVE)
+
+# Fixed alignment Dong/WiLoR wrist frame -> Panda flange frame. Identity until
+# calibrated in the viewer (etapa 2): the one empirical value, not a design
+# choice. Rotates the relative wrist delta into the flange's axes.
+_R_ALIGN = np.eye(3)
+
+
+def _pose4x4(pos: np.ndarray, quat_wxyz: np.ndarray) -> np.ndarray:
+    """Build a 4x4 homogeneous transform from position + wxyz quaternion."""
+    m = np.zeros(9)
+    mujoco.mju_quat2Mat(m, np.asarray(quat_wxyz, dtype=np.float64))
+    t = np.eye(4)
+    t[:3, :3] = m.reshape(3, 3)
+    t[:3, 3] = pos
+    return t
+
+
+def _mat2quat(r: np.ndarray) -> np.ndarray:
+    """wxyz quaternion from a 3x3 rotation matrix."""
+    q = np.zeros(4)
+    mujoco.mju_mat2Quat(q, np.ascontiguousarray(r, dtype=np.float64).reshape(9))
+    return q
 
 # Panda home (identical to the Allegro env so the arm starts in a known pose).
 _PANDA_HOME = np.asarray((0, -0.785, 0, -2.35, 0, 1.57, np.pi / 4))
@@ -164,9 +188,74 @@ class FingerReceiver:
             pass
 
 
+class WristReceiver:
+    """Stage-2 streaming receiver: a daemon UDP thread holding the latest wrist
+    pose as a 4x4 transform (12 float64 = 3x4 [R|t], the sim_teleop VIVE wire
+    format). Decoupled — only started with --recv-wrist; default path holds the
+    wrist welded to the home flange pose."""
+
+    def __init__(self, port: int = _WRIST_UDP_PORT, host: str = "127.0.0.1"):
+        self._lock = threading.Lock()
+        self._latest: np.ndarray | None = None
+        self._stop = False
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.settimeout(0.1)
+        self._sock.bind((host, port))
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self):
+        while not self._stop:
+            try:
+                data, _ = self._sock.recvfrom(2048)
+                if len(data) < 12 * 8:
+                    continue
+                pose = np.frombuffer(data, dtype=np.float64, count=12).reshape(3, 4)
+                t = np.eye(4)
+                t[:3, :] = pose
+                with self._lock:
+                    self._latest = t
+            except socket.timeout:
+                continue
+            except Exception:
+                pass
+
+    def latest(self) -> np.ndarray | None:
+        with self._lock:
+            return None if self._latest is None else self._latest.copy()
+
+    def close(self):
+        self._stop = True
+        try:
+            self._sock.close()
+        except Exception:
+            pass
+
+
+def wrist_target(tracker_now: np.ndarray, tracker_start: np.ndarray,
+                 ee_start: np.ndarray, r_align: np.ndarray = _R_ALIGN,
+                 pose_scale: float = _WRIST_POSE_SCALE) -> tuple[np.ndarray, np.ndarray]:
+    """Map a streamed wrist pose to a flange mocap target (sim_teleop VIVE scheme).
+
+    delta = inv(start) @ now is the wrist motion since the anchor frame; r_align
+    rotates that delta into the flange's axes; the result is applied to the flange
+    pose captured at anchor time. Returns (pos, quat_wxyz).
+    """
+    delta = np.linalg.inv(tracker_start) @ tracker_now
+    dR = r_align @ delta[:3, :3] @ r_align.T
+    dt = pose_scale * (r_align @ delta[:3, 3])
+    delta_aligned = np.eye(4)
+    delta_aligned[:3, :3] = dR
+    delta_aligned[:3, 3] = dt
+    target = ee_start @ delta_aligned
+    return target[:3, 3].copy(), _mat2quat(target[:3, :3])
+
+
 def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int = 1500,
         record: str | None = None, shot: str | None = None, cam: str = "front",
-        sweep_wrist: bool = False, recv_fingers: bool = False):
+        sweep_wrist: bool = False, recv_fingers: bool = False,
+        recv_wrist: bool = False):
     task = REGISTRY[task_name]
     model = build_spec(task.arena).compile()
     data = mujoco.MjData(model)
@@ -200,6 +289,12 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int = 1500,
     q24_addrs = build_qpos24_scatter(model) if recv_fingers else None
     q_scratch = np.zeros(model.nq) if recv_fingers else None
 
+    # Stage 2 (flagged): live wrist pose over UDP 5012 (VIVE-style relative
+    # delta from the first received frame). ee_start = flange pose at anchor.
+    wrist_rx = WristReceiver() if recv_wrist else None
+    ee_start = _pose4x4(home_pos, home_quat) if recv_wrist else None
+    tracker_start: np.ndarray | None = None
+
     task.reset()
     succeeded = False
 
@@ -226,6 +321,16 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int = 1500,
                 data.mocap_pos[mocap] = p
                 data.mocap_quat[mocap] = q
 
+            # Stage 2 (flagged): live wrist pose -> mocap (anchor on 1st packet).
+            if wrist_rx is not None:
+                tnow = wrist_rx.latest()
+                if tnow is not None:
+                    if tracker_start is None:
+                        tracker_start = tnow
+                    p, q = wrist_target(tnow, tracker_start, ee_start)
+                    data.mocap_pos[mocap] = p
+                    data.mocap_quat[mocap] = q
+
             # Arm: OSC hold/track the wrist target (stage 1 = no wrist motion).
             tau = opspace(
                 model=model, data=data, site_id=site_id, dof_ids=panda_dof,
@@ -245,6 +350,8 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int = 1500,
             viewer.close()
         if fing_rx is not None:
             fing_rx.close()
+        if wrist_rx is not None:
+            wrist_rx.close()
 
     if rec is not None:
         if shot:
@@ -293,4 +400,5 @@ if __name__ == "__main__":
         cam=flags.get("--cam", "front"),
         sweep_wrist="--sweep-wrist" in flags,
         recv_fingers="--recv-fingers" in flags,
+        recv_wrist="--recv-wrist" in flags,
     )
