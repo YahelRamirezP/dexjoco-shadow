@@ -23,7 +23,9 @@ Usage:
     python -m shadow_ext.teleop_driver --view     # + viewer
 """
 from __future__ import annotations
+import socket
 import sys
+import threading
 import numpy as np
 import mujoco
 
@@ -33,6 +35,19 @@ from .build import build_spec
 from .mapping import build_finger_map, qpos_to_ctrl
 from .tasks import REGISTRY
 from .recorder import Recorder
+
+# Shadow 24-DOF order emitted by the retargeter (Menagerie order, matches
+# _SHADOW_LOWER/_UPPER in retarget.py). First 2 (wrist) are padded to 0 there.
+# The streaming receiver scatters an incoming [24] vector to model qpos by NAME.
+_SHADOW_24_ORDER = (
+    "WRJ2", "WRJ1",
+    "FFJ4", "FFJ3", "FFJ2", "FFJ1",
+    "MFJ4", "MFJ3", "MFJ2", "MFJ1",
+    "RFJ4", "RFJ3", "RFJ2", "RFJ1",
+    "LFJ5", "LFJ4", "LFJ3", "LFJ2", "LFJ1",
+    "THJ5", "THJ4", "THJ3", "THJ2", "THJ1",
+)
+_FINGER_UDP_PORT = 5014   # matches sim_teleop hand port (right hand)
 
 # Panda home (identical to the Allegro env so the arm starts in a known pose).
 _PANDA_HOME = np.asarray((0, -0.785, 0, -2.35, 0, 1.57, np.pi / 4))
@@ -95,9 +110,63 @@ def wrist_sweep_pose(k: int, n_steps: int, home_pos: np.ndarray,
     return pos, quat
 
 
+def build_qpos24_scatter(model: mujoco.MjModel) -> np.ndarray:
+    """Return addrs[24]: model qpos address for each Shadow joint in retargeter
+    (Menagerie) order, so a streamed [24] vector scatters into a model qpos."""
+    addrs = []
+    for jn in _SHADOW_24_ORDER:
+        jid = model.joint(f"{_JNT_PREFIX}{jn}").id
+        addrs.append(int(model.jnt_qposadr[jid]))
+    return np.asarray(addrs, dtype=int)
+
+
+class FingerReceiver:
+    """Stage-1 streaming receiver: a daemon UDP thread that holds the latest
+    retargeter qpos[24] (float64, Menagerie order). Decoupled — only started
+    when --recv-fingers is set; the default hand-tuned path never touches it."""
+
+    def __init__(self, port: int = _FINGER_UDP_PORT, host: str = "127.0.0.1"):
+        self._lock = threading.Lock()
+        self._latest: np.ndarray | None = None
+        self._stop = False
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.settimeout(0.1)
+        self._sock.bind((host, port))
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self):
+        while not self._stop:
+            try:
+                data, _ = self._sock.recvfrom(4096)
+                if not data:
+                    continue
+                q = np.frombuffer(data, dtype=np.float64)
+                if q.size < 24:
+                    continue
+                with self._lock:
+                    self._latest = q[:24].copy()
+            except socket.timeout:
+                continue
+            except Exception:
+                pass
+
+    def latest(self) -> np.ndarray | None:
+        with self._lock:
+            return None if self._latest is None else self._latest.copy()
+
+    def close(self):
+        self._stop = True
+        try:
+            self._sock.close()
+        except Exception:
+            pass
+
+
 def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int = 1500,
         record: str | None = None, shot: str | None = None, cam: str = "front",
-        sweep_wrist: bool = False):
+        sweep_wrist: bool = False, recv_fingers: bool = False):
     task = REGISTRY[task_name]
     model = build_spec(task.arena).compile()
     data = mujoco.MjData(model)
@@ -125,15 +194,30 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int = 1500,
     ctrl_close = np.clip(qpos_to_ctrl(q_target, fing_ids, fing_plan),
                          fing_ctrlrange[:, 0], fing_ctrlrange[:, 1])
 
+    # Stage 1 (flagged): live retargeter qpos over UDP 5014 instead of the
+    # hand-tuned close target. Scatter [24] (Menagerie order) -> model qpos.
+    fing_rx = FingerReceiver() if recv_fingers else None
+    q24_addrs = build_qpos24_scatter(model) if recv_fingers else None
+    q_scratch = np.zeros(model.nq) if recv_fingers else None
+
     task.reset()
     succeeded = False
 
     viewer = mujoco.viewer.launch_passive(model, data) if view else None
     try:
         for k in range(n_steps):
-            # Fingers: ramp open->close over first ~1/3, then hold closed.
-            alpha = min(1.0, k / (n_steps / 3.0))
-            data.ctrl[fing_ids] = alpha * ctrl_close
+            # Fingers: streamed retargeter qpos (flagged) or hand-tuned ramp.
+            if fing_rx is not None:
+                q24 = fing_rx.latest()
+                if q24 is not None:
+                    q_scratch[q24_addrs] = q24
+                    data.ctrl[fing_ids] = np.clip(
+                        qpos_to_ctrl(q_scratch, fing_ids, fing_plan),
+                        fing_ctrlrange[:, 0], fing_ctrlrange[:, 1])
+                # else: no packet yet -> hold last ctrl (hand starts open at 0)
+            else:
+                alpha = min(1.0, k / (n_steps / 3.0))
+                data.ctrl[fing_ids] = alpha * ctrl_close
 
             # Stage 0 (flagged): drive the mocap with a known moving+rotating
             # target to verify the arm tracks it. Default path stays held-fixed.
@@ -159,6 +243,8 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int = 1500,
     finally:
         if viewer is not None:
             viewer.close()
+        if fing_rx is not None:
+            fing_rx.close()
 
     if rec is not None:
         if shot:
@@ -206,4 +292,5 @@ if __name__ == "__main__":
         shot=flags.get("--shot"),
         cam=flags.get("--cam", "front"),
         sweep_wrist="--sweep-wrist" in flags,
+        recv_fingers="--recv-fingers" in flags,
     )
