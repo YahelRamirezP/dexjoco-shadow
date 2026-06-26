@@ -65,8 +65,39 @@ def _panda_ids(model):
     return dof, ctrl
 
 
+def wrist_sweep_pose(k: int, n_steps: int, home_pos: np.ndarray,
+                     home_quat: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Stage-0 foundation check (decoupled from the live path): a known
+    time-varying wrist target around the welded home pose. Translation = small
+    lissajous; orientation = oscillating tilt about a rotating axis. Drives the
+    mocap so we can confirm in the viewer that the Panda flange TRACKS both
+    position AND orientation through OSC before any WiLoR/UDP wiring exists.
+
+    No WiLoR, no network: pure proof that mocap->arm follows rotation, the one
+    thing the held-fixed stage-1 path never exercised.
+    """
+    t = k / max(1, n_steps)               # 0..1 over the run
+    # Translation: lissajous, ~8 cm envelope.
+    amp = 0.08
+    dpos = np.array([
+        amp * np.sin(2 * np.pi * 1.0 * t),
+        amp * np.sin(2 * np.pi * 2.0 * t),
+        0.5 * amp * np.sin(2 * np.pi * 1.5 * t),
+    ])
+    pos = home_pos + dpos
+    # Orientation: angle oscillates up to ~0.5 rad about a slowly rotating axis.
+    angle = 0.5 * np.sin(2 * np.pi * 1.0 * t)
+    axis = np.array([np.cos(2 * np.pi * 0.5 * t), np.sin(2 * np.pi * 0.5 * t), 0.0])
+    dquat = np.zeros(4)
+    mujoco.mju_axisAngle2Quat(dquat, axis, angle)
+    quat = np.zeros(4)
+    mujoco.mju_mulQuat(quat, home_quat, dquat)
+    return pos, quat
+
+
 def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int = 1500,
-        record: str | None = None, shot: str | None = None, cam: str = "front"):
+        record: str | None = None, shot: str | None = None, cam: str = "front",
+        sweep_wrist: bool = False):
     task = REGISTRY[task_name]
     model = build_spec(task.arena).compile()
     data = mujoco.MjData(model)
@@ -86,6 +117,8 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int = 1500,
     mujoco.mj_forward(model, data)
     data.mocap_pos[mocap] = data.sensor("franka/flange_pos").data.copy()
     data.mocap_quat[mocap] = data.sensor("franka/flange_quat").data.copy()
+    home_pos = data.mocap_pos[mocap].copy()
+    home_quat = data.mocap_quat[mocap].copy()
 
     # Finger close target, mapped 24 joints -> 20 ctrl, clipped to actuator range.
     q_target = finger_target_qpos(model)
@@ -102,7 +135,14 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int = 1500,
             alpha = min(1.0, k / (n_steps / 3.0))
             data.ctrl[fing_ids] = alpha * ctrl_close
 
-            # Arm: OSC hold at the fixed wrist target (stage 1 = no wrist motion).
+            # Stage 0 (flagged): drive the mocap with a known moving+rotating
+            # target to verify the arm tracks it. Default path stays held-fixed.
+            if sweep_wrist:
+                p, q = wrist_sweep_pose(k, n_steps, home_pos, home_quat)
+                data.mocap_pos[mocap] = p
+                data.mocap_quat[mocap] = q
+
+            # Arm: OSC hold/track the wrist target (stage 1 = no wrist motion).
             tau = opspace(
                 model=model, data=data, site_id=site_id, dof_ids=panda_dof,
                 pos=data.mocap_pos[mocap], ori=data.mocap_quat[mocap], joint=_PANDA_HOME,
@@ -165,4 +205,5 @@ if __name__ == "__main__":
         record=flags.get("--record"),
         shot=flags.get("--shot"),
         cam=flags.get("--cam", "front"),
+        sweep_wrist="--sweep-wrist" in flags,
     )
