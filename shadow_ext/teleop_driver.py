@@ -23,11 +23,19 @@ Usage:
     python -m shadow_ext.teleop_driver --view     # + viewer
 """
 from __future__ import annotations
+import json
 import socket
 import sys
 import threading
+import time
 import numpy as np
 import mujoco
+
+try:
+    from pynput import keyboard as _kb
+    _PYNPUT_OK = True
+except ImportError:
+    _PYNPUT_OK = False
 
 from dexjoco.sim.controllers import opspace
 
@@ -55,6 +63,129 @@ _WRIST_POSE_SCALE = 1.0   # delta-translation gain (sim_teleop uses 1.5 for VIVE
 # calibrated in the viewer (etapa 2): the one empirical value, not a design
 # choice. Rotates the relative wrist delta into the flange's axes.
 _R_ALIGN = np.eye(3)
+
+_KEY_STEP = 0.005   # metres per keypress
+
+
+class _KeyController:
+    """Non-blocking keyboard arm-position control (requires pynput).
+
+    Keys (work even when MuJoCo viewer has focus):
+        W/S  -> +Y / -Y   (forward / back)
+        A/D  -> -X / +X   (left / right)
+        Q/E  -> +Z / -Z   (up / down)
+        R    -> reset delta to zero
+    """
+
+    _MAP = {
+        'w': np.array([ 0,  1,  0], dtype=float),
+        's': np.array([ 0, -1,  0], dtype=float),
+        'a': np.array([-1,  0,  0], dtype=float),
+        'd': np.array([ 1,  0,  0], dtype=float),
+        'q': np.array([ 0,  0,  1], dtype=float),
+        'e': np.array([ 0,  0, -1], dtype=float),
+    }
+
+    def __init__(self, step: float = _KEY_STEP):
+        self._step = step
+        self._lock = threading.Lock()
+        self._delta = np.zeros(3)
+        self._listener = _kb.Listener(on_press=self._on_press)
+        self._listener.start()
+
+    def _on_press(self, key):
+        try:
+            ch = key.char.lower() if hasattr(key, 'char') and key.char else None
+        except Exception:
+            ch = None
+        if ch == 'r':
+            with self._lock:
+                self._delta[:] = 0.0
+        elif ch in self._MAP:
+            with self._lock:
+                self._delta += self._MAP[ch] * self._step
+
+    def delta(self) -> np.ndarray:
+        with self._lock:
+            return self._delta.copy()
+
+    def close(self):
+        self._listener.stop()
+
+
+_WAYPOINT_DWELL = 0.5   # seconds to hold each waypoint before moving to next
+
+
+class _PoseRecorder:
+    """Record arm waypoints interactively (Space = save current pos, Ctrl+C = done)."""
+
+    def __init__(self, path: str):
+        self._path = path
+        self._waypoints: list[dict] = []
+        self._pending_save = False
+        self._lock = threading.Lock()
+        if _PYNPUT_OK:
+            self._listener = _kb.Listener(on_press=self._on_press)
+            self._listener.start()
+
+    def _on_press(self, key):
+        if key == _kb.Key.space:
+            with self._lock:
+                self._pending_save = True
+
+    def poll_save(self, pos: np.ndarray, quat: np.ndarray) -> bool:
+        with self._lock:
+            if self._pending_save:
+                self._pending_save = False
+                wp = {"pos": pos.tolist(), "quat": quat.tolist()}
+                self._waypoints.append(wp)
+                print(f"  Waypoint {len(self._waypoints)} saved: pos={np.round(pos,3)}")
+                return True
+        return False
+
+    def save(self):
+        with open(self._path, "w") as f:
+            json.dump(self._waypoints, f, indent=2)
+        print(f"Saved {len(self._waypoints)} waypoints -> {self._path}")
+
+    def close(self):
+        if _PYNPUT_OK:
+            self._listener.stop()
+
+
+class _PosePlayback:
+    """Play back recorded waypoints, dwelling at each for DWELL seconds."""
+
+    def __init__(self, path: str, dwell: float = _WAYPOINT_DWELL):
+        with open(path) as f:
+            data = json.load(f)
+        self._waypoints = [(np.array(w["pos"]), np.array(w["quat"])) for w in data]
+        self._dwell = dwell
+        self._idx = 0
+        self._t_arrived: float | None = None
+        print(f"Loaded {len(self._waypoints)} waypoints from {path}")
+
+    def current(self) -> tuple[np.ndarray, np.ndarray]:
+        return self._waypoints[min(self._idx, len(self._waypoints) - 1)]
+
+    def step(self, pos: np.ndarray):
+        """Advance to next waypoint when close enough and dwell elapsed."""
+        if self._idx >= len(self._waypoints):
+            return
+        target_pos, _ = self._waypoints[self._idx]
+        dist = np.linalg.norm(pos - target_pos)
+        if dist < 0.02:
+            if self._t_arrived is None:
+                self._t_arrived = time.time()
+            elif time.time() - self._t_arrived >= self._dwell:
+                self._idx = min(self._idx + 1, len(self._waypoints) - 1)
+                self._t_arrived = None
+        else:
+            self._t_arrived = None
+
+    @property
+    def done(self) -> bool:
+        return self._idx >= len(self._waypoints) - 1
 
 
 def _pose4x4(pos: np.ndarray, quat_wxyz: np.ndarray) -> np.ndarray:
@@ -255,7 +386,9 @@ def wrist_target(tracker_now: np.ndarray, tracker_start: np.ndarray,
 def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int = 1500,
         record: str | None = None, shot: str | None = None, cam: str = "front",
         sweep_wrist: bool = False, recv_fingers: bool = False,
-        recv_wrist: bool = False):
+        recv_wrist: bool = False, orient_only: bool = False,
+        wait_anchor: bool = False, key_control: bool = False,
+        record_poses: str | None = None, playback_poses: str | None = None):
     task = REGISTRY[task_name]
     model = build_spec(task.arena).compile()
     data = mujoco.MjData(model)
@@ -295,6 +428,28 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int = 1500,
     ee_start = _pose4x4(home_pos, home_quat) if recv_wrist else None
     tracker_start: np.ndarray | None = None
 
+    if recv_wrist and wait_anchor:
+        print("Hold your hand in the desired neutral pose, then press Enter to set anchor...")
+        input()
+        # Drain stale packets; next packet becomes the anchor
+        if wrist_rx is not None:
+            with wrist_rx._lock:
+                wrist_rx._latest = None
+
+    key_ctrl = None
+    if key_control or record_poses:
+        if not _PYNPUT_OK:
+            print("WARNING: pynput not installed. Install with: pip install pynput")
+        else:
+            key_ctrl = _KeyController()
+            print("Keyboard arm control active: W/S=Y  A/D=X  Q/E=Z  R=reset")
+
+    pose_rec = _PoseRecorder(record_poses) if record_poses else None
+    pose_pb  = _PosePlayback(playback_poses) if playback_poses else None
+
+    if pose_rec:
+        print("RECORD MODE: move arm with WASD/QE, press Space to save waypoint, Ctrl+C to finish.")
+
     task.reset()
     succeeded = False
 
@@ -327,9 +482,27 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int = 1500,
                 if tnow is not None:
                     if tracker_start is None:
                         tracker_start = tnow
-                    p, q = wrist_target(tnow, tracker_start, ee_start)
+                    scale = 0.0 if orient_only else _WRIST_POSE_SCALE
+                    p, q = wrist_target(tnow, tracker_start, ee_start,
+                                        pose_scale=scale)
                     data.mocap_pos[mocap] = p
                     data.mocap_quat[mocap] = q
+
+            # Keyboard arm control: shift mocap position by accumulated delta.
+            if key_ctrl is not None:
+                data.mocap_pos[mocap] = home_pos + key_ctrl.delta()
+
+            # Pose recorder: Space saves current mocap pos+quat as waypoint.
+            if pose_rec is not None:
+                pose_rec.poll_save(data.mocap_pos[mocap].copy(),
+                                   data.mocap_quat[mocap].copy())
+
+            # Pose playback: drive mocap through recorded waypoints.
+            if pose_pb is not None:
+                p, q = pose_pb.current()
+                data.mocap_pos[mocap] = p
+                data.mocap_quat[mocap] = q
+                pose_pb.step(data.mocap_pos[mocap])
 
             # Arm: OSC hold/track the wrist target (stage 1 = no wrist motion).
             tau = opspace(
@@ -352,6 +525,11 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int = 1500,
             fing_rx.close()
         if wrist_rx is not None:
             wrist_rx.close()
+        if key_ctrl is not None:
+            key_ctrl.close()
+        if pose_rec is not None:
+            pose_rec.save()
+            pose_rec.close()
 
     if rec is not None:
         if shot:
@@ -367,7 +545,8 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int = 1500,
     return succeeded
 
 
-_VALUE_FLAGS = ("--record", "--shot", "--cam")
+_VALUE_FLAGS = ("--record", "--shot", "--cam", "--n-steps",
+                "--record-poses", "--playback-poses")
 
 
 def _parse(argv):
@@ -395,10 +574,16 @@ if __name__ == "__main__":
     run(
         task_name=task_name,
         view="--view" in flags,
+        n_steps=int(flags.get("--n-steps", 1500)),
         record=flags.get("--record"),
         shot=flags.get("--shot"),
         cam=flags.get("--cam", "front"),
         sweep_wrist="--sweep-wrist" in flags,
         recv_fingers="--recv-fingers" in flags,
         recv_wrist="--recv-wrist" in flags,
+        orient_only="--orient-only" in flags,
+        wait_anchor="--wait-anchor" in flags,
+        key_control="--key-control" in flags,
+        record_poses=flags.get("--record-poses"),
+        playback_poses=flags.get("--playback-poses"),
     )
