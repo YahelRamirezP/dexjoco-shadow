@@ -21,6 +21,13 @@ with a per-frame qpos stream; the mapping + ctrl path is unchanged.
 Usage:
     python -m shadow_ext.teleop_driver            # headless, prints metrics
     python -m shadow_ext.teleop_driver --view     # + viewer
+
+Trial window: a live session (--view, or --recv-fingers/--recv-wrist) runs
+paced to wall-clock time, for `--duration` seconds (default 60.0), not a raw
+step count -- one CLI invocation = one trial, ending in success or timeout.
+--n-steps still overrides with a raw step budget for offline/scripted runs
+that don't need wall-clock pacing.
+    python -m shadow_ext.teleop_driver pick_bucket --view --recv-fingers --recv-wrist --duration 60
 """
 from __future__ import annotations
 import json
@@ -383,7 +390,8 @@ def wrist_target(tracker_now: np.ndarray, tracker_start: np.ndarray,
     return target[:3, 3].copy(), _mat2quat(target[:3, :3])
 
 
-def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int = 1500,
+def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int | None = None,
+        duration: float = 60.0,
         record: str | None = None, shot: str | None = None, cam: str = "front",
         sweep_wrist: bool = False, recv_fingers: bool = False,
         recv_wrist: bool = False, orient_only: bool = False,
@@ -392,6 +400,13 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int = 1500,
     task = REGISTRY[task_name]
     model = build_spec(task.arena).compile()
     data = mujoco.MjData(model)
+    dt = float(model.opt.timestep)
+    # For live human teleop, the trial window is a wall-clock duration, not a
+    # step count: --n-steps overrides for the scripted/offline paths that still
+    # want a fixed step budget, but the default path derives steps from
+    # `duration` seconds so one trial = `duration` seconds of real time.
+    if n_steps is None:
+        n_steps = int(round(duration / dt))
 
     rec = Recorder(model, cam=cam) if (record or shot) else None
 
@@ -452,6 +467,12 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int = 1500,
 
     task.reset()
     succeeded = False
+    # Live sessions (viewer open, or a human streaming fingers/wrist over UDP)
+    # must run at wall-clock speed: mj_step() alone is far faster than dt, so
+    # without pacing the whole n_steps budget elapses before a human's motion
+    # ever reaches the sim (root cause of the "closes before I can do anything"
+    # symptom). Offline/scripted runs (no viewer, no live input) skip pacing.
+    live = view or recv_fingers or recv_wrist
 
     viewer = mujoco.viewer.launch_passive(model, data) if view else None
     try:
@@ -513,11 +534,17 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int = 1500,
             data.ctrl[panda_ctrl] = tau
 
             mujoco.mj_step(model, data)
-            succeeded = task.update(model, data) or succeeded
+            just_succeeded = task.update(model, data)
+            succeeded = just_succeeded or succeeded
             if rec is not None and record:
                 rec.maybe_capture(data, k)
             if viewer is not None:
                 viewer.sync()
+            if live:
+                time.sleep(dt)
+            if just_succeeded:
+                print(f"succeeded at t={k * dt:.1f}s (of {n_steps * dt:.0f}s budget) -> ending trial early")
+                break
     finally:
         if viewer is not None:
             viewer.close()
@@ -545,7 +572,7 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int = 1500,
     return succeeded
 
 
-_VALUE_FLAGS = ("--record", "--shot", "--cam", "--n-steps",
+_VALUE_FLAGS = ("--record", "--shot", "--cam", "--n-steps", "--duration",
                 "--record-poses", "--playback-poses")
 
 
@@ -574,7 +601,8 @@ if __name__ == "__main__":
     run(
         task_name=task_name,
         view="--view" in flags,
-        n_steps=int(flags.get("--n-steps", 1500)),
+        n_steps=int(flags["--n-steps"]) if "--n-steps" in flags else None,
+        duration=float(flags.get("--duration", 60.0)),
         record=flags.get("--record"),
         shot=flags.get("--shot"),
         cam=flags.get("--cam", "front"),
