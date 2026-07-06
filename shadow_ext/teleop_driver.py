@@ -35,8 +35,10 @@ import socket
 import sys
 import threading
 import time
+from pathlib import Path
 import numpy as np
 import mujoco
+import yaml
 
 try:
     from pynput import keyboard as _kb
@@ -71,53 +73,164 @@ _WRIST_POSE_SCALE = 1.0   # delta-translation gain (sim_teleop uses 1.5 for VIVE
 # choice. Rotates the relative wrist delta into the flange's axes.
 _R_ALIGN = np.eye(3)
 
-_KEY_STEP = 0.005   # metres per keypress
+_KEY_STEP = 0.005      # metres per keypress
+_ROT_STEP = 0.05       # radians per keypress
+_APERTURE_STEP = 0.05  # grasp aperture fraction per keypress (0..1 range)
+
+# Canonical grasp: pose_close from the Feix-taxonomy YAML, applied directly
+# (no retargeter/teleop path). Menagerie 24-DOF order matches _SHADOW_24_ORDER.
+_CANONICAL_YAML = (Path(__file__).resolve().parents[2]
+                    / "robot" / "hands" / "shadow_hand"
+                    / "shadow_hand_canonical_v5_grasp.yaml")
+_DEFAULT_GRASP_CLASS = "Parallel Extension"
+
+
+def load_canonical_open_close_qpos24(class_name: str,
+                                      yaml_path: Path = _CANONICAL_YAML,
+                                      ) -> tuple[np.ndarray, np.ndarray]:
+    """(pose_open[24], pose_close[24]), Menagerie order, for one Feix class.
+    Aperture convention from the YAML's own _meta: qpos = (1-a)*open + a*close,
+    a in 0..1 (0=open, 1=closed) -- lets the grasp be dialed continuously
+    instead of a hard on/off toggle."""
+    data = yaml.safe_load(yaml_path.read_text())
+    for entry in data.values():
+        if isinstance(entry, dict) and entry.get("class_name") == class_name:
+            return (np.asarray(entry["pose_open"], dtype=np.float64),
+                    np.asarray(entry["pose_close"], dtype=np.float64))
+    known = sorted(e["class_name"] for e in data.values() if isinstance(e, dict))
+    raise KeyError(f"grasp class {class_name!r} not found. Known: {known}")
+
+
+_DEFAULT_POSE_FILE = Path(__file__).resolve().parent / "saved_key_pose.json"
+
+
+def save_key_pose(path: Path, pos: np.ndarray, quat: np.ndarray, aperture: float):
+    path.write_text(json.dumps({
+        "pos": pos.tolist(), "quat": quat.tolist(), "aperture": aperture,
+    }, indent=2))
+
+
+def load_key_pose(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    d = json.loads(path.read_text())
+    # "aperture" (continuous 0..1) supersedes the old binary "grasp_closed"
+    # field; accept old saves too (True/False -> 1.0/0.0).
+    aperture = d["aperture"] if "aperture" in d else float(bool(d.get("grasp_closed")))
+    return {
+        "pos": np.asarray(d["pos"], dtype=np.float64),
+        "quat": np.asarray(d["quat"], dtype=np.float64),
+        "aperture": float(aperture),
+    }
 
 
 class _KeyController:
-    """Non-blocking keyboard arm-position control (requires pynput).
+    """Keyboard arm-position/orientation control via the MuJoCo viewer's own
+    key_callback (GLFW key events on the viewer window) -- NOT pynput. pynput's
+    global hook relies on the X Record extension, which WSLg does not implement,
+    so it silently never receives keystrokes there. GLFW window-focused events
+    work under WSLg because they go through the same compositor that renders
+    the viewer. Requires --view (keys are only delivered while the viewer window
+    has focus); pass `on_key` as `key_callback=` to `mujoco.viewer.launch_passive`.
 
-    Keys (work even when MuJoCo viewer has focus):
+    Keys (viewer window must have focus):
         W/S  -> +Y / -Y   (forward / back)
         A/D  -> -X / +X   (left / right)
         Q/E  -> +Z / -Z   (up / down)
-        R    -> reset delta to zero
+        I/K  -> pitch +/- (tilt palm forward / back, local X axis)
+        J/L  -> yaw   +/- (turn palm left / right, local Z axis)
+        U/O  -> roll  +/- (spin palm CW / CCW, local Y axis)
+        UP/DOWN -> close/open the canonical grasp continuously (aperture 0..1)
+        G    -> snap grasp fully open (0.0) / fully closed (1.0), toggles
+        P    -> save current wrist pose + grasp aperture to --pose-file
+        R    -> reset position + orientation delta to zero, hand open
     """
 
     _MAP = {
-        'w': np.array([ 0,  1,  0], dtype=float),
-        's': np.array([ 0, -1,  0], dtype=float),
-        'a': np.array([-1,  0,  0], dtype=float),
-        'd': np.array([ 1,  0,  0], dtype=float),
-        'q': np.array([ 0,  0,  1], dtype=float),
-        'e': np.array([ 0,  0, -1], dtype=float),
+        ord('W'): np.array([ 0,  1,  0], dtype=float),
+        ord('S'): np.array([ 0, -1,  0], dtype=float),
+        ord('A'): np.array([-1,  0,  0], dtype=float),
+        ord('D'): np.array([ 1,  0,  0], dtype=float),
+        ord('Q'): np.array([ 0,  0,  1], dtype=float),
+        ord('E'): np.array([ 0,  0, -1], dtype=float),
     }
+    # axis + sign per rotation key, applied in the flange's local frame.
+    _ROT_MAP = {
+        ord('I'): (np.array([1., 0., 0.]),  1.0),
+        ord('K'): (np.array([1., 0., 0.]), -1.0),
+        ord('J'): (np.array([0., 0., 1.]),  1.0),
+        ord('L'): (np.array([0., 0., 1.]), -1.0),
+        ord('U'): (np.array([0., 1., 0.]),  1.0),
+        ord('O'): (np.array([0., 1., 0.]), -1.0),
+    }
+    _KEY_UP, _KEY_DOWN = 265, 264   # GLFW_KEY_UP / GLFW_KEY_DOWN
 
-    def __init__(self, step: float = _KEY_STEP):
+    def __init__(self, step: float = _KEY_STEP, rot_step: float = _ROT_STEP,
+                 aperture_step: float = _APERTURE_STEP):
         self._step = step
+        self._rot_step = rot_step
+        self._aperture_step = aperture_step
         self._lock = threading.Lock()
         self._delta = np.zeros(3)
-        self._listener = _kb.Listener(on_press=self._on_press)
-        self._listener.start()
+        self._quat = np.array([1.0, 0.0, 0.0, 0.0])  # accumulated rotation, wxyz
+        self._aperture = 0.0  # 0=open, 1=fully closed (canonical pose_close)
+        self._save_requested = False
 
-    def _on_press(self, key):
-        try:
-            ch = key.char.lower() if hasattr(key, 'char') and key.char else None
-        except Exception:
-            ch = None
-        if ch == 'r':
+    def on_key(self, keycode: int):
+        """`key_callback` for `mujoco.viewer.launch_passive` -- runs on the
+        viewer's render thread, hence the lock (main loop reads concurrently)."""
+        if keycode == ord('R'):
             with self._lock:
                 self._delta[:] = 0.0
-        elif ch in self._MAP:
+                self._quat[:] = [1.0, 0.0, 0.0, 0.0]
+                self._aperture = 0.0
+        elif keycode == ord('G'):
             with self._lock:
-                self._delta += self._MAP[ch] * self._step
+                self._aperture = 0.0 if self._aperture > 0.5 else 1.0
+        elif keycode == self._KEY_UP:
+            with self._lock:
+                self._aperture = min(1.0, self._aperture + self._aperture_step)
+        elif keycode == self._KEY_DOWN:
+            with self._lock:
+                self._aperture = max(0.0, self._aperture - self._aperture_step)
+        elif keycode == ord('P'):
+            with self._lock:
+                self._save_requested = True
+        elif keycode in self._MAP:
+            with self._lock:
+                self._delta += self._MAP[keycode] * self._step
+        elif keycode in self._ROT_MAP:
+            axis, sign = self._ROT_MAP[keycode]
+            dquat = np.zeros(4)
+            mujoco.mju_axisAngle2Quat(dquat, axis, sign * self._rot_step)
+            with self._lock:
+                new_quat = np.zeros(4)
+                mujoco.mju_mulQuat(new_quat, self._quat, dquat)
+                self._quat[:] = new_quat
 
     def delta(self) -> np.ndarray:
         with self._lock:
             return self._delta.copy()
 
+    def quat_delta(self) -> np.ndarray:
+        with self._lock:
+            return self._quat.copy()
+
+    def aperture(self) -> float:
+        with self._lock:
+            return self._aperture
+
+    def pop_save_request(self) -> bool:
+        with self._lock:
+            req, self._save_requested = self._save_requested, False
+            return req
+
+    def set_aperture(self, val: float):
+        with self._lock:
+            self._aperture = val
+
     def close(self):
-        self._listener.stop()
+        pass  # no listener thread to stop -- callback lifetime is the viewer's
 
 
 _WAYPOINT_DWELL = 0.5   # seconds to hold each waypoint before moving to next
@@ -396,7 +509,9 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int | None 
         sweep_wrist: bool = False, recv_fingers: bool = False,
         recv_wrist: bool = False, orient_only: bool = False,
         wait_anchor: bool = False, key_control: bool = False,
-        record_poses: str | None = None, playback_poses: str | None = None):
+        record_poses: str | None = None, playback_poses: str | None = None,
+        grasp_class: str = _DEFAULT_GRASP_CLASS,
+        pose_file: str | Path = _DEFAULT_POSE_FILE):
     task = REGISTRY[task_name]
     model = build_spec(task.arena).compile()
     data = mujoco.MjData(model)
@@ -426,10 +541,41 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int | None 
     home_pos = data.mocap_pos[mocap].copy()
     home_quat = data.mocap_quat[mocap].copy()
 
+    # Manual mode: resume from a saved wrist pose instead of the arena's default
+    # home, so pressing R (reset) or restarting the script doesn't lose your
+    # positioning work. Saved via 'P' below into --pose-file.
+    pose_file = Path(pose_file)
+    loaded_aperture = 0.0
+    if key_control:
+        saved = load_key_pose(pose_file)
+        if saved is not None:
+            home_pos, home_quat = saved["pos"], saved["quat"]
+            loaded_aperture = saved["aperture"]
+            print(f"Resumed saved pose from {pose_file} (aperture={loaded_aperture:.2f})")
+
     # Finger close target, mapped 24 joints -> 20 ctrl, clipped to actuator range.
     q_target = finger_target_qpos(model)
     ctrl_close = np.clip(qpos_to_ctrl(q_target, fing_ids, fing_plan),
                          fing_ctrlrange[:, 0], fing_ctrlrange[:, 1])
+
+    # Manual mode (--key-control): fingers dial continuously between the
+    # canonical class's pose_open (aperture=0) and pose_close (aperture=1) via
+    # UP/DOWN. No retargeter -- direct qpos interpolation, then the same
+    # 24->20 ctrl mapping used everywhere else.
+    q24_addrs_manual = build_qpos24_scatter(model)
+    _, _pose_close24 = load_canonical_open_close_qpos24(grasp_class)
+    # The YAML's pose_open is the medoid of the LEAST-closed grasps in the
+    # dataset (Dexonomy/HOGraspNet has zero true open-hand frames), not a flat
+    # extended hand -- e.g. Parallel Extension's pose_open still has several
+    # joints > 1.0 rad. Use qpos=0 (full extension) as the real open endpoint.
+    _pose_open24 = np.zeros(24)
+
+    def _ctrl_for_aperture(a: float) -> np.ndarray:
+        q24 = (1.0 - a) * _pose_open24 + a * _pose_close24
+        q_scratch = np.zeros(model.nq)
+        q_scratch[q24_addrs_manual] = q24
+        return np.clip(qpos_to_ctrl(q_scratch, fing_ids, fing_plan),
+                       fing_ctrlrange[:, 0], fing_ctrlrange[:, 1])
 
     # Stage 1 (flagged): live retargeter qpos over UDP 5014 instead of the
     # hand-tuned close target. Scatter [24] (Menagerie order) -> model qpos.
@@ -453,11 +599,19 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int | None 
 
     key_ctrl = None
     if key_control or record_poses:
-        if not _PYNPUT_OK:
-            print("WARNING: pynput not installed. Install with: pip install pynput")
-        else:
-            key_ctrl = _KeyController()
-            print("Keyboard arm control active: W/S=Y  A/D=X  Q/E=Z  R=reset")
+        if key_control and not view:
+            print("WARNING: --key-control needs --view (keys are delivered to "
+                  "the MuJoCo viewer window, no viewer = no input).")
+        key_ctrl = _KeyController()
+        key_ctrl.set_aperture(loaded_aperture)
+        if key_control:
+            print("Keyboard control active (viewer window must have focus): "
+                  "W/S=Y A/D=X Q/E=Z (move) I/K=pitch J/L=yaw U/O=roll (rotate) "
+                  f"UP/DOWN=grasp aperture ({grasp_class}) G=snap open/close "
+                  "P=save pose R=reset")
+        if record_poses and not _PYNPUT_OK:
+            print("WARNING: pynput not installed -- needed for --record-poses "
+                  "Space-to-save. Install with: pip install pynput")
 
     pose_rec = _PoseRecorder(record_poses) if record_poses else None
     pose_pb  = _PosePlayback(playback_poses) if playback_poses else None
@@ -474,7 +628,9 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int | None 
     # symptom). Offline/scripted runs (no viewer, no live input) skip pacing.
     live = view or recv_fingers or recv_wrist
 
-    viewer = mujoco.viewer.launch_passive(model, data) if view else None
+    viewer = mujoco.viewer.launch_passive(
+        model, data, key_callback=key_ctrl.on_key if key_ctrl is not None else None,
+    ) if view else None
     try:
         for k in range(n_steps):
             # Fingers: streamed retargeter qpos (flagged) or hand-tuned ramp.
@@ -486,6 +642,8 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int | None 
                         qpos_to_ctrl(q_scratch, fing_ids, fing_plan),
                         fing_ctrlrange[:, 0], fing_ctrlrange[:, 1])
                 # else: no packet yet -> hold last ctrl (hand starts open at 0)
+            elif key_ctrl is not None:
+                data.ctrl[fing_ids] = _ctrl_for_aperture(key_ctrl.aperture())
             else:
                 alpha = min(1.0, k / (n_steps / 3.0))
                 data.ctrl[fing_ids] = alpha * ctrl_close
@@ -509,9 +667,18 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int | None 
                     data.mocap_pos[mocap] = p
                     data.mocap_quat[mocap] = q
 
-            # Keyboard arm control: shift mocap position by accumulated delta.
+            # Keyboard arm control: shift mocap position/orientation by
+            # accumulated delta (translation additive, rotation composed onto
+            # home_quat, same convention as wrist_sweep_pose).
             if key_ctrl is not None:
                 data.mocap_pos[mocap] = home_pos + key_ctrl.delta()
+                kq = np.zeros(4)
+                mujoco.mju_mulQuat(kq, home_quat, key_ctrl.quat_delta())
+                data.mocap_quat[mocap] = kq
+                if key_ctrl.pop_save_request():
+                    save_key_pose(pose_file, data.mocap_pos[mocap].copy(),
+                                  data.mocap_quat[mocap].copy(), key_ctrl.aperture())
+                    print(f"Saved pose -> {pose_file} (aperture={key_ctrl.aperture():.2f})")
 
             # Pose recorder: Space saves current mocap pos+quat as waypoint.
             if pose_rec is not None:
@@ -573,7 +740,7 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int | None 
 
 
 _VALUE_FLAGS = ("--record", "--shot", "--cam", "--n-steps", "--duration",
-                "--record-poses", "--playback-poses")
+                "--record-poses", "--playback-poses", "--grasp-class", "--pose-file")
 
 
 def _parse(argv):
@@ -614,4 +781,6 @@ if __name__ == "__main__":
         key_control="--key-control" in flags,
         record_poses=flags.get("--record-poses"),
         playback_poses=flags.get("--playback-poses"),
+        grasp_class=flags.get("--grasp-class", _DEFAULT_GRASP_CLASS),
+        pose_file=flags.get("--pose-file", _DEFAULT_POSE_FILE),
     )
