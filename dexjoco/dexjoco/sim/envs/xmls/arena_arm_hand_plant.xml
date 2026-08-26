@@ -4,7 +4,7 @@
   <include file="plant.xml" />
   <include file="spray.xml" />
   
-  <option timestep=".002" noslip_iterations="5" noslip_tolerance="0" />
+  <option timestep=".002" noslip_iterations="5" noslip_tolerance="0" cone="elliptic" impratio="10" />
   <statistic center="0.3 0 0.4" extent=".8" />
   <visual>
     <headlight diffuse=".4 .4 .4" ambient=".5 .5 .5" />

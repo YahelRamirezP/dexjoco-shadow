@@ -67,7 +67,7 @@
           <geom type="mesh" material="black" contype="0" conaffinity="0" group="2"/>
         </default>
         <default class="plastic_collision">
-          <geom group="3"/>
+          <geom group="3" condim="4" friction="1.0 0.02 0.005"/>
         </default>
       </default>
     </default>

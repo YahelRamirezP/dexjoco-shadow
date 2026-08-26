@@ -112,7 +112,7 @@
         </default>
 
         <default class="fingertip_collision">
-          <geom type="capsule" size="0.012 0.01" pos="0 0 0.019"/>
+          <geom type="capsule" size="0.012 0.01" pos="0 0 0.019" condim="4" friction="1.0 0.02 0.005"/>
           <default class="thumbtip_collision">
             <geom type="capsule" size="0.012 0.008" pos="0 0 0.035"/>
           </default>
