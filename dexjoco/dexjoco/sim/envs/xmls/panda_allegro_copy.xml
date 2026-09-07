@@ -53,7 +53,14 @@
   <default>
     <default class="allegro_right">
       <joint axis="0 1 0" damping=".1"/>
-      <position kp="2"/>
+      <!-- kp=2, no kv: original values, way below real Allegro Hand hardware
+      (gains_pd.yaml: kp 600-1000, kd 15-30) -- essentially no holding torque
+      once the finger reaches its target angle, so it can't resist the arm's
+      inertia during lift (see docs/diagnostico_fuerza_agarre_2026-08-03.md).
+      Bumped 10x + added kv as a first pass, NOT copied 1:1 from hardware
+      (different torque/inertia scale) -- needs live tuning in the viewer:
+      raise kp more if it still falls apart, raise kv if it oscillates/buzzes. -->
+      <position kp="20" kv="2"/>
       <geom density="800"/>
 
       <default class="visual">

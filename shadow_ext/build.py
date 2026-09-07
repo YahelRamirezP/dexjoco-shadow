@@ -42,6 +42,14 @@ def build_spec(arena_name: str = "arena_arm_hand_bucket_pick.xml") -> mujoco.MjS
     shadow = mujoco.MjSpec.from_file(SHADOW)
     site.attach_body(shadow.body("rh_forearm"), "rh-", "")
 
+    # attach_body only grafts the body subtree, not shadow's own <option> block --
+    # carry over its solver tuning (Menagerie shadow_hand/right_hand.xml) by hand,
+    # otherwise the compiled model silently falls back to MuJoCo defaults
+    # (cone=pyramidal, impratio=1), which under-stiffens tangential/friction
+    # constraints relative to normal ones and lets grasps slip under lateral load.
+    spec.option.cone = shadow.option.cone
+    spec.option.impratio = shadow.option.impratio
+
     # resolve mesh/texture paths to absolute (runtime only; not serialized)
     roots = [XMLS, os.path.join(SHADOW_DIR, "assets"), SHADOW_DIR]
     for m in spec.meshes:
