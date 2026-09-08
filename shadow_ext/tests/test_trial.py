@@ -275,9 +275,12 @@ def test_consolidation_keeps_interruptions_practice_and_missing_data(tmp_path):
     assert len(report["trials"]) == 5
     group = report["groups"][0]
     assert group["successful_trials"] == 1
-    assert group["evaluable_trials"] == 2
-    assert group["excluded_trials"] == 3
-    assert group["success_rate"] == .5
+    # manual interruption is a real attempted outcome (counts as a failure,
+    # same as a time_limit), not an excluded data point -- only "practice"
+    # and "unstarted" are excluded here.
+    assert group["evaluable_trials"] == 3
+    assert group["excluded_trials"] == 2
+    assert group["success_rate"] == pytest.approx(1 / 3)
     assert group["median_time_to_success_wall_s"] == 3
     assert not session_summary(tmp_path / "missing")["eligible"]
     with pytest.raises(ValueError, match="once"):
@@ -297,9 +300,29 @@ def test_consolidation_rejects_wrong_hand_or_missing_camera_coverage(tmp_path):
     op_path.write_text(json.dumps(operator))
     sim_path = session / "sim/metadata.json"
     sim = json.loads(sim_path.read_text())
-    sim["termination_monotonic_ns"] = 6_000_000_000
+    sim["end_ns"] = 20_000_000_000  # past operator end_ns (5e9) by more than the tail tolerance
     sim_path.write_text(json.dumps(sim))
     assert session_summary(session)["exclusion_reasons"] == ["operator_does_not_cover_evaluation"]
+
+
+def test_manual_interruption_within_shutdown_tolerance_is_eligible(tmp_path):
+    # Real pattern from a live manual interruption: the operator closes the
+    # webcam window a couple of real seconds before the sim's own last
+    # recorded physics tick, since the two are stopped by hand in separate
+    # terminals. That gap alone must not disqualify an otherwise-valid trial.
+    session = make_session(tmp_path / "interrupted", reason="manual_interruption")
+    op_path = session / "operator/metadata.json"
+    operator = json.loads(op_path.read_text())
+    operator["end_ns"] = 4_000_000_000 - 2_400_000_000  # camera stopped 2.4s before sim's end_ns
+    op_path.write_text(json.dumps(operator))
+    row = session_summary(session)
+    assert row["eligible"]
+    assert row["exclusion_reasons"] == []
+
+    # But a gap past the tolerance still correctly excludes it.
+    operator["end_ns"] = 4_000_000_000 - 6_000_000_000
+    op_path.write_text(json.dumps(operator))
+    assert "operator_does_not_cover_evaluation" in session_summary(session)["exclusion_reasons"]
 
 
 

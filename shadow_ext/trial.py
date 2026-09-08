@@ -1,6 +1,15 @@
 """Evaluation timing, provenance and consolidated session summaries (no physics)."""
 from __future__ import annotations
 
+# A manual interruption stops the simulator and the webcam recorder in two
+# separate terminals by hand; a few real seconds between the two is normal
+# human shutdown timing, not missing evidence -- the actual task-relevant
+# content (an operator watching a drop and deciding to stop) is essentially
+# certain to be well within it. Applied only to the operator's END coverage
+# (a few seconds of camera tail is harmless); the START side stays exact,
+# since there is no equivalent reason to accept the camera starting late.
+_COVERAGE_TAIL_TOLERANCE_NS = 5_000_000_000
+
 import argparse
 from collections import Counter
 from datetime import datetime, timezone
@@ -94,7 +103,7 @@ def session_summary(session):
         problems.append('evaluation_not_started')
     if sim.get('trial_kind') != 'evaluation':
         problems.append('not_an_evaluation_trial')
-    if sim.get('stop_reason') not in ('success', 'time_limit'):
+    if sim.get('stop_reason') not in ('success', 'time_limit', 'manual_interruption'):
         problems.append('termination_' + str(sim.get('stop_reason', 'missing')))
     if not operator.get('complete'):
         problems.append('operator_incomplete_or_missing')
@@ -104,9 +113,13 @@ def session_summary(session):
             or operator.get('clock') != sim.get('clock')):
         problems.append('clock_mismatch_or_unknown')
     start = evaluation.get('start_monotonic_ns')
-    end = sim.get('termination_monotonic_ns', sim.get('end_ns'))
+    # end_ns (last recorded physics state), not termination_monotonic_ns: the
+    # latter includes post-interruption cleanup (flushing state chunks to
+    # disk), real wall-clock time that has nothing to do with what the
+    # camera needs to have covered.
+    end = sim.get('end_ns', sim.get('termination_monotonic_ns'))
     if (start is None or end is None or operator.get('start_ns', math.inf) > start
-            or operator.get('end_ns', -math.inf) < end):
+            or operator.get('end_ns', -math.inf) < end - _COVERAGE_TAIL_TOLERANCE_NS):
         problems.append('operator_does_not_cover_evaluation')
     return {
         'session_id': session.name, 'session_path': str(session),
@@ -163,8 +176,10 @@ def consolidate(sessions):
                         'median_time_to_success_wall_s': statistics.median(times) if times else None,
                         'range_time_to_success_wall_s': [min(times), max(times)] if times else None})
     return {'format_version': 1, 'generated_at_utc': datetime.now(timezone.utc).isoformat(),
-            'inclusion_rule': 'Completed evaluation with explicit start, success/time_limit termination, '
-                              'and complete same-hand webcam covering evaluation on the same clock',
+            'inclusion_rule': 'Completed evaluation with explicit start, a real attempted outcome '
+                              '(success, time_limit, or manual interruption -- anything else, e.g. a '
+                              'technical error, is excluded as not a valid data point), and complete '
+                              'same-hand webcam covering evaluation on the same clock',
             'trials': rows, 'groups': results}
 
 
