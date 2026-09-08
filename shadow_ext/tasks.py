@@ -34,6 +34,7 @@ class PickBucket(_Task):
 
     def reset(self):
         self._bottom_z0 = None
+        self.metrics = None
 
     def update(self, model, data) -> bool:
         bottom_ids = [model.site(f"bucket_ref_{i}").id for i in (0, 2, 4, 6)]
@@ -45,6 +46,14 @@ class PickBucket(_Task):
         inside = np.all(box_pos >= corners.min(0)) and np.all(box_pos <= corners.max(0))
         bottom_z = data.site_xpos[bottom_ids, 2]
         lifted = np.all(bottom_z - self._bottom_z0 >= 0.15)
+        self.metrics = {
+            'food_sensor_pos_m': box_pos.tolist(), 'bucket_corners_m': corners.tolist(),
+            'bottom_reference_z_m': self._bottom_z0.tolist(),
+            'bottom_lift_m': (bottom_z - self._bottom_z0).tolist(),
+            'minimum_bottom_lift_m': float(np.min(bottom_z - self._bottom_z0)),
+            'lift_threshold_m': 0.15, 'inside_reference_aabb': bool(inside),
+            'lifted': bool(lifted),
+        }
         return bool(inside and lifted)
 
 
@@ -63,6 +72,7 @@ class WaterPlant(_Task):
     def reset(self):
         self._trigger_pulled = False
         self._counter = 0
+        self.metrics = None
 
     def update(self, model, data) -> bool:
         p = data.site_xpos[model.site("ref_point").id]
@@ -70,7 +80,7 @@ class WaterPlant(_Task):
         dx, dy, dz = p - plant
         inside = (dx * dx + dy * dy <= self._R * self._R) and (-self._HALF_H <= dz <= self._HALF_H)
 
-        trig = float(data.sensor("spray_joint_0_pos").data)
+        trig = float(data.sensor("spray_joint_0_pos").data[0])
         if trig < self._TRIGGER_RELEASE:
             self._trigger_pulled = False
         elif trig > self._TRIGGER_PULL:
@@ -80,6 +90,14 @@ class WaterPlant(_Task):
             self._counter += 1
         else:
             self._counter = 0
+        self.metrics = {
+            'spray_reference_pos_m': p.tolist(), 'plant_pos_m': plant.tolist(),
+            'inside_cylinder': bool(inside), 'trigger_position': trig,
+            'trigger_pulled': self._trigger_pulled, 'consecutive_steps': self._counter,
+            'required_steps': self._STEPS_REQUIRED, 'radius_m': self._R,
+            'half_height_m': self._HALF_H, 'trigger_release': self._TRIGGER_RELEASE,
+            'trigger_pull': self._TRIGGER_PULL,
+        }
         return self._counter >= self._STEPS_REQUIRED
 
 
@@ -103,6 +121,7 @@ class PinchTongs(_Task):
         self._pinch_count = 0
         self._pinch_in_progress = False
         self._success_counter = 0
+        self.metrics = None
 
     def update(self, model, data) -> bool:
         tongs_pos = data.sensor("tongs_pos").data
@@ -110,7 +129,7 @@ class PinchTongs(_Task):
             self._lift_z = float(tongs_pos[2]) + self._LIFT_HEIGHT
 
         # pinch counter: open->close edge increments
-        jp = float(data.sensor("tongs_joint_0_pos").data)
+        jp = float(data.sensor("tongs_joint_0_pos").data[0])
         if jp <= self._CLOSE_THRESH and self._pinch_in_progress:
             self._pinch_in_progress = False
             self._pinch_count += 1
@@ -123,6 +142,14 @@ class PinchTongs(_Task):
             self._success_counter += 1
         else:
             self._success_counter = 0
+        self.metrics = {
+            'tongs_pos_m': tongs_pos.tolist(), 'lift_threshold_z_m': self._lift_z,
+            'joint_position': jp, 'pinch_count': self._pinch_count,
+            'pinch_in_progress': self._pinch_in_progress, 'lifted': bool(lifted),
+            'consecutive_steps': self._success_counter, 'required_steps': self._STEPS_REQUIRED,
+            'required_pinches': self._REQUIRED_PINCHES,
+            'close_threshold': self._CLOSE_THRESH, 'open_threshold': self._OPEN_THRESH,
+        }
         return self._success_counter >= self._STEPS_REQUIRED
 
 
@@ -147,6 +174,7 @@ class HammerNail(_Task):
         self._nail_depth = 0.0
         self._prev_face_z = None
         self._vz_buf = []
+        self.metrics = None
 
     def _setup(self, model, data):
         nail_body = model.body("nail")
@@ -197,6 +225,13 @@ class HammerNail(_Task):
                     data.mocap_pos[self._nail_mocap_id] = pos
                     data.mocap_quat[self._nail_mocap_id] = self._nail_init_quat
 
+        self.metrics = {
+            'nail_depth_m': self._nail_depth, 'success_depth_m': self._SUCCESS_DEPTH,
+            'hammer_nail_contact': hit, 'face_z_m': self._prev_face_z,
+            'face_velocity_buffer_m_s': list(self._vz_buf),
+            'velocity_threshold_m_s': self._VEL_THRESH,
+            'impact_step_m': self._IMPACT_STEP, 'max_depth_m': self._MAX_DEPTH,
+        }
         return self._nail_depth >= self._SUCCESS_DEPTH
 
 

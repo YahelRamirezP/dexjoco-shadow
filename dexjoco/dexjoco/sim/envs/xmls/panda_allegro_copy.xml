@@ -59,8 +59,18 @@
       inertia during lift (see docs/diagnostico_fuerza_agarre_2026-08-03.md).
       Bumped 10x + added kv as a first pass, NOT copied 1:1 from hardware
       (different torque/inertia scale) -- needs live tuning in the viewer:
-      raise kp more if it still falls apart, raise kv if it oscillates/buzzes. -->
-      <position kp="20" kv="2"/>
+      raise kp more if it still falls apart, raise kv if it oscillates/buzzes.
+
+      forcerange=0.7 Nm: real Allegro V4 continuous per-joint torque spec
+      (wonikrobotics/allegrohand.com). Without it, torque = kp*error is
+      unbounded, and the retargeter streams raw UDP qpos targets with no
+      smoothing -- a target jump of >1 rad in one packet times kp=20 spikes
+      way past what real hardware could ever produce, which is what threw the
+      object and kicked the arm during the live Allegro rehearsal (2026-09-08,
+      docs/diagnostico-allegro-practica-2026-09-08.json:
+      max_reconstructed_servo_torque_Nm ~26-37, max_hand_command_jump_rad
+      ~1.1). Matches how shadow_hand/right_hand.xml caps every actuator. -->
+      <position kp="20" kv="2" forcerange="-0.7 0.7"/>
       <geom density="800"/>
 
       <default class="visual">

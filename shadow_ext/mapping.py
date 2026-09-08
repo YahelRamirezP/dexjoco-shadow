@@ -20,10 +20,18 @@ _ACT_PREFIX = "rh-rh_A_"     # compiled actuator names, e.g. "rh-rh_A_FFJ0"
 _JNT_PREFIX = "rh-rh_"       # compiled joint names,    e.g. "rh-rh_FFJ2"
 
 
-def build_finger_map(model: mujoco.MjModel):
+def build_finger_map(model: mujoco.MjModel, hand: str = "shadow"):
     """Return (ctrl_ids[20], plan) where plan[k] = list of joint qpos addresses
     to SUM for actuator ctrl_ids[k]. Single-joint actuators have a 1-element list.
     """
+    if hand == "allegro":
+        names = [f"{finger}{i}" for finger in ("ff", "mf", "rf", "th") for i in range(4)]
+        ctrl = [model.actuator(n[:-1] + "a" + n[-1]).id for n in names]
+        plan = [[int(model.jnt_qposadr[model.joint(n[:-1] + "j" + n[-1]).id])]
+                for n in names]
+        return np.asarray(ctrl, dtype=int), plan
+    if hand != "shadow":
+        raise ValueError(f"Unsupported hand: {hand}")
     ctrl_ids: list[int] = []
     plan: list[list[int]] = []
     for i in range(model.nu):

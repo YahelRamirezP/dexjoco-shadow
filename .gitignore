@@ -3,6 +3,7 @@ __pycache__/
 *$py.class
 .DS_Store
 .vscode/
+.venv/
 
 /outputs
 /checkpoints

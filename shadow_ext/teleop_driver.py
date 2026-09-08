@@ -1,36 +1,22 @@
-"""Stage-1 functional teleop driver for Panda+Shadow (no RL machinery).
+"""Functional teleoperation and recorded trials for Panda + Shadow or Allegro.
 
-What it is: the lean path to a task-success METRIC for evaluating the retargeter
-in sim. It loads the attached Panda+Shadow scene, holds the wrist fixed via the
-Panda OSC controller (stage 1: no wrist motion), and streams finger angles to the
-Shadow actuators through the 24->20 coupling map. Each step it reports:
+Shadow is the default. Allegro uses --hand allegro --recv-fingers and accepts
+the retargeter's 16-joint stream; it has no Shadow canonical-grasp controls.
 
-  - grasp_lift: object lifted >= LIFT_THRESH off the table (grasp success, the
-    metric available at stage 1 with a fixed wrist).
-  - bucket_place: object inside the bucket footprint AND lifted (the full
-    DexJoCo task; only reachable once wrist translation lands -> stage 3).
+--session DIR saves full physics states, task metrics and operator events.
+Legacy --duration is a simulation-time step budget. To measure a trial use
+--evaluation-start manual --time-limit SECONDS --view: F5 starts the interval
+after preparation and F6 records a phase marker. Use --trial-kind evaluation
+--operator-id ID --condition-id ID for measured trials; practice is the default.
+--n-steps is an optional additional cap. Both clocks and termination are saved.
 
-What it is NOT: a Gymnasium env. No cameras, no obs space, no reward shaping, no
-domain randomization. Those belong to RL data collection, which is a separate
-goal (copy the gym env then).
-
-The finger input here is a hand-tuned close target (a placeholder for the live
-retargeter qpos). Swapping in the retargeter = replace `finger_target_qpos()`
-with a per-frame qpos stream; the mapping + ctrl path is unchanged.
-
-Usage:
-    python -m shadow_ext.teleop_driver            # headless, prints metrics
-    python -m shadow_ext.teleop_driver --view     # + viewer
-
-Trial window: a live session (--view, or --recv-fingers/--recv-wrist) runs
-paced to wall-clock time, for `--duration` seconds (default 60.0), not a raw
-step count -- one CLI invocation = one trial, ending in success or timeout.
---n-steps still overrides with a raw step budget for offline/scripted runs
-that don't need wall-clock pacing.
-    python -m shadow_ext.teleop_driver pick_bucket --view --recv-fingers --recv-wrist --duration 60
+Example:
+    python -m shadow_ext.teleop_driver pick_bucket --view --key-control --recv-fingers
 """
 from __future__ import annotations
 import csv
+import itertools
+import math
 import json
 import os
 import socket
@@ -78,6 +64,27 @@ _R_ALIGN = np.eye(3)
 _KEY_STEP = 0.005      # metres per keypress
 _ROT_STEP = 0.05       # radians per keypress
 _APERTURE_STEP = 0.05  # grasp aperture fraction per keypress (0..1 range)
+_CONTINUOUS_MOVE_RATE = 0.25  # metres/second while a move key is held (--continuous-move)
+_CONTINUOUS_ROT_RATE = 2.5    # radians/second while a rotate key is held
+# First-pass defaults, live-tunable per run with --move-rate/--rot-rate --
+# confirmed live 2026-09-08 that 0.05/0.5 felt slower than just tapping.
+
+# --finger-slew-rate (opt-in, off by default -- see run()): the retargeter
+# streams a new finger qpos target every UDP packet (~3-4 Hz) and it gets
+# applied to data.ctrl in ONE physics step, i.e. an instant target jump.
+# Measured against a real recorded Allegro session (2026-09-08,
+# allegro-bucket-practice-007), replaying its actual commanded finger
+# targets through mj_step with forcerange=+-0.7 (Allegro V4 spec): the
+# actuators were force-saturated in ~100% of steps regardless of kp --
+# the reference itself demands more torque than 0.7 Nm can deliver against
+# finger inertia, so tracking degenerates into bang-bang/relay control
+# (the "abrupt steps" symptom) instead of smooth PD. Slew-limiting the
+# target's rate of change to what 0.7 Nm can plausibly achieve cut the
+# saturated fraction from ~100% to ~19% at 1.5 rad/s in that same replay
+# (5/2.5/1.5 rad/s -> 96%/81%/19% saturated). 1.5 rad/s default below is a
+# first pass from that number, not confirmed live -- needs a feel check,
+# and slower values trade responsiveness for smoothness.
+_FINGER_SLEW_RATE = 1.5  # radians/second per joint
 
 # Canonical grasp: pose_close from the Feix-taxonomy YAML, applied directly
 # (no retargeter/teleop path). Menagerie 24-DOF order matches _SHADOW_24_ORDER.
@@ -246,8 +253,31 @@ class _KeyController:
         self._save_requested = False
         self._advance_requested = False
         self._retreat_requested = False
+        self._events = []
 
     def on_key(self, keycode: int):
+        supported = (set(self._MAP) | set(self._ROT_MAP) |
+                     {self._KP['ENTER'], self._KP['0'], self._KP['DECIMAL'],
+                      self._KP['5'], self._KEY_UP, self._KEY_DOWN,
+                      self._KEY_RIGHT, self._KEY_LEFT, 294, 295})
+        if keycode not in supported:
+            return
+        stamp = time.monotonic_ns()
+        self._apply_key(keycode)
+        with self._lock:
+            self._events.append({
+                'keycode': keycode, 'input_monotonic_ns': stamp,
+                'position_delta_m': self._delta.tolist(),
+                'quaternion_delta_wxyz': self._quat.tolist(),
+                'aperture': self._aperture,
+            })
+
+    def pop_events(self):
+        with self._lock:
+            events, self._events = self._events, []
+            return events
+
+    def _apply_key(self, keycode: int):
         """`key_callback` for `mujoco.viewer.launch_passive` -- runs on the
         viewer's render thread, hence the lock (main loop reads concurrently)."""
         if keycode == self._KP['ENTER']:
@@ -285,6 +315,16 @@ class _KeyController:
                 mujoco.mju_mulQuat(new_quat, self._quat, dquat)
                 self._quat[:] = new_quat
 
+    def apply_continuous(self, dpos: np.ndarray, dquat: np.ndarray):
+        """Fold in one physics step's worth of held-key motion (see
+        _ContinuousMoveTracker) -- same accumulator as a discrete keypress,
+        so ENTER-reset and the pose-save path keep working unchanged."""
+        with self._lock:
+            self._delta += dpos
+            new_quat = np.zeros(4)
+            mujoco.mju_mulQuat(new_quat, self._quat, dquat)
+            self._quat[:] = new_quat
+
     def delta(self) -> np.ndarray:
         with self._lock:
             return self._delta.copy()
@@ -318,6 +358,82 @@ class _KeyController:
 
     def close(self):
         pass  # no listener thread to stop -- callback lifetime is the viewer's
+
+
+class _ContinuousMoveTracker:
+    """Global press/release listener so translate/rotate keys move the arm
+    continuously while held, instead of one _KEY_STEP per physical press.
+
+    mujoco.viewer's key_callback cannot do this by itself: verified against
+    MuJoCo's own glfw_adapter.cc, `IsKeyDownEvent(act)` is `act == GLFW_PRESS`
+    -- GLFW_REPEAT (OS key-repeat while held) and GLFW_RELEASE never reach the
+    Python callback, so there is no way to tell "held" from "tapped
+    repeatedly" from key_callback alone (confirmed live 2026-09-08: arm only
+    moved once per press). pynput's global hook gets real press/release pairs
+    instead, at the cost of the same tradeoff _PoseRecorder/_ShotController
+    already accept: it fires regardless of window focus.
+
+    Requires NumLock ON, like the existing numpad table: the resolved char
+    for a keypad key without NumLock is an arrow/Home/etc, not a digit, so
+    held-key chars wouldn't match _MOVE_CHARS/_ROT_CHARS at all.
+    """
+
+    _MOVE_CHARS = {
+        '8': np.array([ 0.,  1.,  0.]), '2': np.array([ 0., -1.,  0.]),
+        '4': np.array([-1.,  0.,  0.]), '6': np.array([ 1.,  0.,  0.]),
+        '7': np.array([ 0.,  0.,  1.]), '9': np.array([ 0.,  0., -1.]),
+    }
+    _ROT_CHARS = {
+        '1': (np.array([1., 0., 0.]),  1.0), '3': (np.array([1., 0., 0.]), -1.0),
+        '/': (np.array([0., 0., 1.]),  1.0), '*': (np.array([0., 0., 1.]), -1.0),
+        '-': (np.array([0., 1., 0.]),  1.0), '+': (np.array([0., 1., 0.]), -1.0),
+    }
+
+    def __init__(self, rate: float = _CONTINUOUS_MOVE_RATE, rot_rate: float = _CONTINUOUS_ROT_RATE):
+        self._rate, self._rot_rate = rate, rot_rate
+        self._held: set[str] = set()
+        self._lock = threading.Lock()
+        if _PYNPUT_OK:
+            self._listener = _kb.Listener(on_press=self._on_press, on_release=self._on_release)
+            self._listener.start()
+
+    def _char(self, key):
+        try:
+            return key.char if hasattr(key, 'char') and key.char else None
+        except Exception:
+            return None
+
+    def _on_press(self, key):
+        ch = self._char(key)
+        if ch in self._MOVE_CHARS or ch in self._ROT_CHARS:
+            with self._lock:
+                self._held.add(ch)
+
+    def _on_release(self, key):
+        ch = self._char(key)
+        with self._lock:
+            self._held.discard(ch)
+
+    def step(self, dt: float) -> tuple[np.ndarray, np.ndarray]:
+        """One physics step's worth of motion for every key currently held."""
+        with self._lock:
+            held = set(self._held)
+        dpos = np.zeros(3)
+        for ch in held & self._MOVE_CHARS.keys():
+            dpos += self._MOVE_CHARS[ch] * self._rate * dt
+        dquat = np.array([1.0, 0.0, 0.0, 0.0])
+        for ch in held & self._ROT_CHARS.keys():
+            axis, sign = self._ROT_CHARS[ch]
+            step_quat = np.zeros(4)
+            mujoco.mju_axisAngle2Quat(step_quat, axis, sign * self._rot_rate * dt)
+            new_quat = np.zeros(4)
+            mujoco.mju_mulQuat(new_quat, dquat, step_quat)
+            dquat = new_quat
+        return dpos, dquat
+
+    def close(self):
+        if _PYNPUT_OK:
+            self._listener.stop()
 
 
 _WAYPOINT_DWELL = 0.5   # seconds to hold each waypoint before moving to next
@@ -621,7 +737,8 @@ class FingerReceiver:
     retargeter qpos[24] (float64, Menagerie order). Decoupled — only started
     when --recv-fingers is set; the default hand-tuned path never touches it."""
 
-    def __init__(self, port: int = _FINGER_UDP_PORT, host: str = "127.0.0.1"):
+    def __init__(self, port: int = _FINGER_UDP_PORT, host: str = "127.0.0.1", n_joints: int = 24):
+        self.n_joints = n_joints
         self._lock = threading.Lock()
         self._latest: np.ndarray | None = None
         self._stop = False
@@ -639,10 +756,10 @@ class FingerReceiver:
                 if not data:
                     continue
                 q = np.frombuffer(data, dtype=np.float64)
-                if q.size < 24:
+                if q.size != self.n_joints or not np.all(np.isfinite(q)):
                     continue
                 with self._lock:
-                    self._latest = q[:24].copy()
+                    self._latest = q.copy()
             except socket.timeout:
                 continue
             except Exception:
@@ -658,6 +775,7 @@ class FingerReceiver:
             self._sock.close()
         except Exception:
             pass
+        self._thread.join(timeout=1.0)
 
 
 class WristReceiver:
@@ -681,9 +799,11 @@ class WristReceiver:
         while not self._stop:
             try:
                 data, _ = self._sock.recvfrom(2048)
-                if len(data) < 12 * 8:
+                if len(data) != 12 * 8:
                     continue
                 pose = np.frombuffer(data, dtype=np.float64, count=12).reshape(3, 4)
+                if not np.all(np.isfinite(pose)):
+                    continue
                 t = np.eye(4)
                 t[:3, :] = pose
                 with self._lock:
@@ -703,6 +823,7 @@ class WristReceiver:
             self._sock.close()
         except Exception:
             pass
+        self._thread.join(timeout=1.0)
 
 
 class _OneEuroFilter:
@@ -850,13 +971,49 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int | None 
         sweep_wrist: bool = False, recv_fingers: bool = False,
         recv_wrist: bool = False, orient_only: bool = False,
         wait_anchor: bool = False, key_control: bool = False,
+        continuous_move: bool = False,
+        move_rate: float = _CONTINUOUS_MOVE_RATE, rot_rate: float = _CONTINUOUS_ROT_RATE,
+        finger_slew_rate: float | None = None,
         record_poses: str | None = None, playback_poses: str | None = None,
         grasp_class: str = _DEFAULT_GRASP_CLASS,
         pose_file: str | Path = _DEFAULT_POSE_FILE,
         measure_grip: bool = False, log_grip: str | None = None,
         slip_compensate: bool = False, float_object: bool = False,
         state_log: str | None = None, replay_log: str | None = None,
-        session: str | None = None):
+        session: str | None = None, evaluation_start: str | None = None,
+        time_limit: float | None = None, operator_id: str | None = None,
+        trial_kind: str = "practice", condition_id: str | None = None,
+        hand: str = "shadow"):
+    from .trial import Evaluation, provenance, session_summary, write_json
+    Evaluation(evaluation_start, time_limit)
+    if trial_kind not in ("practice", "evaluation"):
+        raise ValueError("trial_kind must be practice or evaluation")
+    if evaluation_start and not session:
+        raise ValueError("Evaluation timing requires --session")
+    if evaluation_start == "manual" and not view:
+        raise ValueError("Manual evaluation start requires --view (F5)")
+    if trial_kind == "evaluation" and not (evaluation_start and time_limit and operator_id and condition_id):
+        raise ValueError("Evaluation trials require start mode, time limit, operator ID and condition ID")
+    if n_steps is not None and n_steps <= 0:
+        raise ValueError("n_steps must be positive")
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError("duration must be finite and positive")
+    explicit_steps = n_steps is not None
+    if continuous_move and not key_control:
+        raise ValueError("--continuous-move requires --key-control")
+    if continuous_move and not _PYNPUT_OK:
+        raise ValueError("--continuous-move needs pynput. Install with: pip install pynput")
+    if finger_slew_rate is not None and (not math.isfinite(finger_slew_rate) or finger_slew_rate <= 0):
+        raise ValueError("--finger-slew-rate must be finite and positive")
+    if hand not in ("shadow", "allegro"):
+        raise ValueError("hand must be shadow or allegro")
+    if hand == "allegro":
+        if not recv_fingers:
+            raise ValueError("Allegro requires --recv-fingers; Shadow canonical grasps do not apply")
+        if slip_compensate or float_object or measure_grip or log_grip:
+            raise ValueError("Allegro grip-assistance/diagnostic options are not integrated")
+        if Path(pose_file) == _DEFAULT_POSE_FILE:
+            pose_file = _DEFAULT_POSE_FILE.with_name("saved_key_pose_allegro.json")
     if session and (Path(session) / "sim").exists():
         raise FileExistsError("Session already contains simulation data; choose a new session")
 
@@ -864,7 +1021,7 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int | None 
         from .replay import render_trace
         return render_trace(replay_log, record, cam=cam)
     task = REGISTRY[task_name]
-    model = build_spec(task.arena).compile()
+    model = build_spec(task.arena, hand=hand).compile()
     data = mujoco.MjData(model)
     dt = float(model.opt.timestep)
     # Legacy budget: duration is converted into physics steps. Live processing
@@ -888,7 +1045,7 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int | None 
     # Panda wrist target mocap, resolved BY NAME (not index 0): hammer scenes have
     # a second mocap (the nail) that may sit at index 0.
     mocap = int(model.body("target").mocapid[0])
-    fing_ids, fing_plan = build_finger_map(model)
+    fing_ids, fing_plan = build_finger_map(model, hand=hand)
     fing_ctrlrange = model.actuator_ctrlrange[fing_ids].copy()
 
     # Reactive slip compensation (--slip-compensate): pure proportional (P) control,
@@ -1059,6 +1216,10 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int | None 
 
     # Home the arm, settle, then weld the wrist target to the current flange pose.
     data.qpos[panda_dof] = _PANDA_HOME
+    if hand == "allegro":
+        neutral = np.clip(np.zeros(len(fing_ids)), fing_ctrlrange[:, 0], fing_ctrlrange[:, 1])
+        data.qpos[[p[0] for p in fing_plan]] = neutral
+        data.ctrl[fing_ids] = neutral
     mujoco.mj_forward(model, data)
     data.mocap_pos[mocap] = data.sensor("franka/flange_pos").data.copy()
     data.mocap_quat[mocap] = data.sensor("franka/flange_quat").data.copy()
@@ -1078,7 +1239,7 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int | None 
             print(f"Resumed saved pose from {pose_file} (aperture={loaded_aperture:.2f})")
 
     # Finger close target, mapped 24 joints -> 20 ctrl, clipped to actuator range.
-    q_target = finger_target_qpos(model)
+    q_target = finger_target_qpos(model) if hand == "shadow" else np.zeros(model.nq)
     ctrl_close = np.clip(qpos_to_ctrl(q_target, fing_ids, fing_plan),
                          fing_ctrlrange[:, 0], fing_ctrlrange[:, 1])
 
@@ -1086,13 +1247,17 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int | None 
     # canonical class's pose_open (aperture=0) and pose_close (aperture=1) via
     # UP/DOWN. No retargeter -- direct qpos interpolation, then the same
     # 24->20 ctrl mapping used everywhere else.
-    q24_addrs_manual = build_qpos24_scatter(model)
-    _, _pose_close24 = load_canonical_open_close_qpos24(grasp_class)
+    q24_addrs_manual = (build_qpos24_scatter(model) if hand == "shadow" else
+                          np.asarray([p[0] for p in fing_plan], dtype=int))
+    if hand == "shadow":
+        _, _pose_close24 = load_canonical_open_close_qpos24(grasp_class)
+    else:
+        _pose_close24 = np.clip(np.zeros(16), fing_ctrlrange[:, 0], fing_ctrlrange[:, 1])
     # The YAML's pose_open is the medoid of the LEAST-closed grasps in the
     # dataset (Dexonomy/HOGraspNet has zero true open-hand frames), not a flat
     # extended hand -- e.g. Parallel Extension's pose_open still has several
     # joints > 1.0 rad. Use qpos=0 (full extension) as the real open endpoint.
-    _pose_open24 = np.zeros(24)
+    _pose_open24 = np.zeros(len(q24_addrs_manual))
 
     def _ctrl_for_aperture(a: float) -> np.ndarray:
         q24 = (1.0 - a) * _pose_open24 + a * _pose_close24
@@ -1103,8 +1268,8 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int | None 
 
     # Stage 1 (flagged): live retargeter qpos over UDP 5014 instead of the
     # hand-tuned close target. Scatter [24] (Menagerie order) -> model qpos.
-    fing_rx = FingerReceiver() if recv_fingers else None
-    q24_addrs = build_qpos24_scatter(model) if recv_fingers else None
+    fing_rx = FingerReceiver(n_joints=len(q24_addrs_manual)) if recv_fingers else None
+    q24_addrs = q24_addrs_manual if recv_fingers else None
     q_scratch = np.zeros(model.nq) if recv_fingers else None
 
     # Stage 2 (flagged): live wrist pose over UDP 5012 (VIVE-style relative
@@ -1132,7 +1297,7 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int | None 
                 wrist_rx._latest = None
 
     key_ctrl = None
-    if key_control or record_poses:
+    if key_control or record_poses or evaluation_start == "manual":
         if key_control and not view:
             print("WARNING: --key-control needs --view (keys are delivered to "
                   "the MuJoCo viewer window, no viewer = no input).")
@@ -1146,6 +1311,13 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int | None 
         if record_poses and not _PYNPUT_OK:
             print("WARNING: pynput not installed -- needed for --record-poses "
                   "Space-to-save. Install with: pip install pynput")
+
+    move_tracker = _ContinuousMoveTracker(rate=move_rate, rot_rate=rot_rate) if continuous_move else None
+    if continuous_move:
+        print(f"Continuous move active (global hook -- fires regardless of window focus, "
+              f"NumLock ON): hold 8/2/4/6/7/9=move 1/3=pitch //*=yaw -/+=roll "
+              f"(move_rate={move_rate} m/s, rot_rate={rot_rate} rad/s -- tune with "
+              f"--move-rate/--rot-rate). Single taps still also work via the numpad key_callback above.")
 
     pose_rec = _PoseRecorder(record_poses) if record_poses else None
     pose_pb  = _PosePlayback(playback_poses) if playback_poses else None
@@ -1200,26 +1372,35 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int | None 
         if session:
             from .state_recording import StateTrace
             import hashlib
-            import subprocess
             code_root = Path(__file__).resolve().parents[1]
-            revision = subprocess.run(
-                ["git", "rev-parse", "HEAD"], cwd=code_root,
-                capture_output=True, text=True, check=False).stdout.strip()
+            source_names = ("teleop_driver.py", "tasks.py", "build.py", "mapping.py",
+                            "state_recording.py", "trial.py", "recorder.py")
+            source_info = provenance(code_root, [Path("shadow_ext") / n for n in source_names])
+            revision = source_info["commit"]
             metadata = {
-                "hand": "shadow", "task": task_name, "arena": task.arena,
+                "hand": hand, "task": task_name, "arena": task.arena,
                 "simulator_commit": revision, "slip_compensate": slip_compensate,
                 "float_object": float_object, "key_control": key_control,
                 "recv_fingers": recv_fingers, "recv_wrist": recv_wrist,
                 "sweep_wrist": sweep_wrist, "grasp_class": grasp_class,
-                "step_limit": n_steps, "requested_duration_s": duration,
-                "budget_clock": "simulation steps (legacy driver behavior)",
+                "session_id": Path(session).resolve().name,
+                "operator_id": operator_id, "trial_kind": trial_kind, "condition_id": condition_id,
+                "provenance": source_info,
+                "integrator": mujoco.mjtIntegrator(model.opt.integrator).name,
+                "evaluation_start": evaluation_start, "time_limit_wall_s": time_limit,
+                "waypoint_mode": ("manual" if key_control else "automatic") if pose_pb else None,
+                "waypoint_transition_s": _PosePlayback._TRANSIT_TIME if key_control and pose_pb else None,
+                "manual_translation_step_m": _KEY_STEP, "manual_rotation_step_rad": _ROT_STEP,
+                "step_limit": n_steps if not evaluation_start or explicit_steps else None,
+                "requested_duration_s": duration,
+                "budget_clock": "wall time after evaluation start" if evaluation_start else "simulation steps (legacy driver behavior)",
                 "success_source": "shadow_ext.tasks." + type(task).__name__ + ".update",
                 "start_definition": "Immediately before the first physics step; includes operator preparation",
                 "timestamp_semantics": "Host monotonic time after physics and task update",
             }
             trace = StateTrace(Path(session) / "sim", model, metadata)
             sources = {}
-            for name in ("teleop_driver.py", "tasks.py", "build.py", "mapping.py", "state_recording.py"):
+            for name in source_names:
                 raw = (Path(__file__).parent / name).read_bytes()
                 (trace.directory / name).write_bytes(raw)
                 sources[name] = hashlib.sha256(raw).hexdigest()
@@ -1231,20 +1412,55 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int | None 
             trace.metadata["source_sha256"] = sources
             trace.append(data, target_ctrl=data.ctrl[fing_ids], slip_bias=slip_bias)
             print(f"[session] Saving full simulation states -> {trace.directory}", flush=True)
-        for k in range(n_steps):
+        if trace is not None and evaluation_start == "immediate":
+            trace.start_evaluation(data)
+        if evaluation_start == "manual":
+            print("[evaluation] Prepare, then press F5 in the simulator. F6 marks a phase.", flush=True)
+        steps = itertools.count() if evaluation_start and not explicit_steps else range(n_steps)
+        for k in steps:
             if viewer is not None and not viewer.is_running():
                 stop_reason = "manual_interruption"
+                break
+            key_events = key_ctrl.pop_events() if key_ctrl is not None else []
+            for event in key_events:
+                if trace is None:
+                    continue
+                code = event["keycode"]
+                if code == 294:
+                    if trace.start_evaluation(data):
+                        task.reset()
+                        succeeded = False
+                        print("[evaluation] Started; task counters and references reset.", flush=True)
+                elif code == 295:
+                    trace.event("phase_marker", data, **event)
+                else:
+                    kind = ("waypoint_request" if code in (262, 263, 325) else
+                            "pose_save_request" if code == 330 else "manual_correction")
+                    trace.event(kind, data, **event)
+            if trace is not None and trace.evaluation.expired(time.monotonic_ns()):
+                stop_reason = "time_limit"
                 break
             # Fingers: streamed retargeter qpos (flagged) or hand-tuned ramp.
             if fing_rx is not None:
                 q24 = fing_rx.latest()
                 if q24 is not None:
                     q_scratch[q24_addrs] = q24
-                    data.ctrl[fing_ids] = np.clip(
+                    raw_fing_target = np.clip(
                         qpos_to_ctrl(q_scratch, fing_ids, fing_plan),
                         fing_ctrlrange[:, 0], fing_ctrlrange[:, 1])
+                    if finger_slew_rate is not None:
+                        # See _FINGER_SLEW_RATE: without this, a new UDP
+                        # packet's target lands in ONE physics step, which
+                        # for Allegro's 0.7 Nm torque cap saturates the
+                        # actuator almost every step and looks/feels like
+                        # bang-bang motion instead of smooth tracking.
+                        max_step = finger_slew_rate * dt
+                        delta = np.clip(raw_fing_target - data.ctrl[fing_ids], -max_step, max_step)
+                        data.ctrl[fing_ids] = data.ctrl[fing_ids] + delta
+                    else:
+                        data.ctrl[fing_ids] = raw_fing_target
                 # else: no packet yet -> hold last ctrl (hand starts open at 0)
-            elif key_ctrl is not None:
+            elif key_ctrl is not None and (key_control or record_poses):
                 data.ctrl[fing_ids] = _ctrl_for_aperture(key_ctrl.aperture())
             else:
                 alpha = min(1.0, k / (n_steps / 3.0))
@@ -1303,9 +1519,10 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int | None 
             # home_pos, so --playback-poses + --key-control compose: playback parks
             # the arm at the saved approach pose, keys fine-adjust/lower/lift from there.
             base_pos, base_quat = None, None
+            previous_waypoint = pose_pb._idx if pose_pb is not None else None
             if pose_pb is not None:
                 base_pos, base_quat = pose_pb.current()
-                if key_ctrl is None:
+                if key_ctrl is None or not (key_control or record_poses):
                     # hands-off playback: auto-advance by position + dwell.
                     pose_pb.step(base_pos)
                 elif key_ctrl.pop_advance_request():
@@ -1318,9 +1535,15 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int | None 
                     pose_pb.retreat()
                     print(f"Back to waypoint {pose_pb._idx + 1}/{len(pose_pb._waypoints)}")
 
+            if trace is not None and pose_pb is not None and pose_pb._idx != previous_waypoint:
+                trace.event("waypoint_transition", data, from_index=previous_waypoint,
+                            to_index=pose_pb._idx, mode="manual" if key_control else "automatic")
             # Keyboard arm control: shift mocap position + rotate mocap orientation
             # by accumulated deltas (I/K pitch, J/L yaw, U/O roll about home/base axes).
-            if key_ctrl is not None:
+            if move_tracker is not None:
+                dpos, dquat = move_tracker.step(dt)
+                key_ctrl.apply_continuous(dpos, dquat)
+            if key_ctrl is not None and (key_control or record_poses):
                 ref_pos = base_pos if base_pos is not None else home_pos
                 ref_quat = base_quat if base_quat is not None else home_quat
                 data.mocap_pos[mocap] = ref_pos + key_ctrl.delta()
@@ -1338,8 +1561,11 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int | None 
 
             # Pose recorder: P saves current mocap pos+quat as waypoint.
             if pose_rec is not None:
-                pose_rec.poll_save(data.mocap_pos[mocap].copy(),
-                                   data.mocap_quat[mocap].copy())
+                saved_waypoint = pose_rec.poll_save(data.mocap_pos[mocap].copy(),
+                                                   data.mocap_quat[mocap].copy())
+                if saved_waypoint and trace is not None:
+                    trace.event("waypoint_saved", data, position_m=data.mocap_pos[mocap].tolist(),
+                                quaternion_wxyz=data.mocap_quat[mocap].tolist())
 
             # Arm: OSC hold/track the wrist target. damping_ratio=1.0 (critical) instead
             # of the old 4 (heavily overdamped, tuned when the wrist target never moved
@@ -1354,7 +1580,14 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int | None 
             )
             data.ctrl[panda_ctrl] = tau
 
+            before_step_time = float(data.time)
+            bad_warnings = [mujoco.mjtWarning.mjWARN_BADQPOS, mujoco.mjtWarning.mjWARN_BADQVEL,
+                            mujoco.mjtWarning.mjWARN_BADQACC, mujoco.mjtWarning.mjWARN_BADCTRL]
+            warning_counts = [data.warning[int(w)].number for w in bad_warnings]
             mujoco.mj_step(model, data)
+            if (data.time <= before_step_time or not np.all(np.isfinite(data.qpos)) or
+                    any(data.warning[int(w)].number > n for w, n in zip(bad_warnings, warning_counts))):
+                raise RuntimeError("MuJoCo reported an unstable state or reset the simulation")
             if state_frames is not None:
                 state_frames.append(data.qpos.copy())
             if measure_grip or float_object:
@@ -1367,10 +1600,14 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int | None 
                     degs = [f"{np.degrees(slip_bias[i]):.1f}deg" for i in active]
                     print(f"[slip] bias active: {list(zip(names, degs))}")
             just_succeeded = task.update(model, data)
+            stamp = time.monotonic_ns()
             succeeded = just_succeeded or succeeded
             if trace is not None:
                 trace.append(data, target_ctrl=raw_finger_target,
-                             slip_bias=applied_slip_bias, success=just_succeeded)
+                             slip_bias=applied_slip_bias, success=just_succeeded,
+                             timestamp_ns=stamp, task_metrics=getattr(task, "metrics", None))
+            evaluation_success = (trace.evaluation.first_success_ns is not None
+                                  if evaluation_start else just_succeeded)
             if rec is not None and record:
                 rec.maybe_capture(data, k)
             if shot_ctrl is not None and shot_ctrl.poll_capture():
@@ -1381,9 +1618,12 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int | None 
                 viewer.sync()
             if live:
                 time.sleep(dt)
-            if just_succeeded:
+            if evaluation_success:
                 stop_reason = "success"
-                print(f"succeeded at t={k * dt:.1f}s (of {n_steps * dt:.0f}s budget) -> ending trial early")
+                print(f"succeeded at simulation t={data.time:.3f}s -> ending trial early")
+                break
+            if trace is not None and trace.evaluation.expired(stamp):
+                stop_reason = "time_limit"
                 break
     except KeyboardInterrupt:
         stop_reason = "manual_interruption"
@@ -1394,49 +1634,75 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int | None 
             trace.metadata["error"] = f"{type(exc).__name__}: {exc}"
         raise
     finally:
-        if trace is not None:
-            trace.close(stop_reason)
-        if viewer is not None:
-            viewer.close()
-        if fing_rx is not None:
-            fing_rx.close()
-        if wrist_rx is not None:
-            wrist_rx.close()
-        if key_ctrl is not None:
-            key_ctrl.close()
-        if pose_rec is not None:
-            pose_rec.save()
-            pose_rec.close()
-        if shot_ctrl is not None:
-            shot_ctrl.close()
-        if grip_log_file is not None:
-            grip_log_file.close()
-            print(f"[grip] slip log saved to {grip_log_path}")
-        if state_frames is not None:
-            # Inside finally: Ctrl+C during a live take must not lose the trace --
-            # that's the one thing --state-log exists to protect against (confirmed
-            # live 2026-09-07: an interrupted run silently dropped it when this save
-            # sat after the try/finally instead of in it).
-            path = _nonclobber_path(Path(state_log))
-            np.savez(path, qpos=np.array(state_frames), dt=dt, task=task_name)
-            print(f"[state-log] {len(state_frames)} frames -> {path}")
+        original_error = sys.exc_info()[0] is not None
+        ended_ns = time.monotonic_ns()
+        loop_stop_reason = stop_reason
+        cleanup_errors = []
 
-    if rec is not None:
-        if record:
-            paths = rec.save_video(record)
-            print(f"video saved: {paths}")
-        rec.close()
+        def cleanup(name, action):
+            try:
+                action()
+            except BaseException as exc:
+                cleanup_errors.append(f"{name}: {type(exc).__name__}: {exc}")
+
+        # Flush evidence before stopping external resources; one cleanup failure
+        # must not prevent the remaining resources from closing.
+        if trace is not None:
+            cleanup("flush states", trace.flush)
+        for name, resource in (("viewer", viewer), ("finger receiver", fing_rx),
+                               ("wrist receiver", wrist_rx), ("keyboard", key_ctrl),
+                               ("continuous move listener", move_tracker),
+                               ("shot listener", shot_ctrl), ("grip log", grip_log_file)):
+            if resource is not None:
+                cleanup(name, resource.close)
+        if pose_rec is not None:
+            cleanup("save waypoints", pose_rec.save)
+            cleanup("waypoint listener", pose_rec.close)
+        if state_frames is not None:
+            def save_legacy_states():
+                path = _nonclobber_path(Path(state_log))
+                np.savez(path, qpos=np.array(state_frames), dt=dt, task=task_name)
+                print(f"[state-log] {len(state_frames)} frames -> {path}")
+            cleanup("legacy states", save_legacy_states)
+        if rec is not None:
+            if record:
+                cleanup("video export", lambda: rec.save_video(record))
+            cleanup("renderer", rec.close)
+        if cleanup_errors:
+            stop_reason = "technical_error"
+        if trace is not None:
+            trace.metadata["loop_stop_reason"] = loop_stop_reason
+            trace.metadata["cleanup_errors"] = cleanup_errors.copy()
+            if cleanup_errors:
+                trace.metadata.setdefault("error", "; ".join(cleanup_errors))
+            trace.metadata["termination_monotonic_ns"] = ended_ns
+            trace.metadata["evaluation"] = trace.evaluation.summary(ended_ns, data.time)
+            cleanup("termination event", lambda: trace.event(
+                "termination", data, timestamp_ns=ended_ns, reason=stop_reason))
+            cleanup("close states", lambda: trace.close(
+                "technical_error" if cleanup_errors else stop_reason))
+            cleanup("trial summary", lambda: write_json(
+                Path(session) / "trial_summary.json", session_summary(session)))
+        if cleanup_errors:
+            print("[cleanup] " + "; ".join(cleanup_errors), file=sys.stderr)
+            if not original_error:
+                raise RuntimeError("Trial cleanup failed: " + "; ".join(cleanup_errors))
+
     if shot:
         print(f"[shot] {shot_count} press(es) this run, files {shot}_NNN_<cam>.png")
 
-    print(f"task={task_name} steps={n_steps}")
-    print(f"succeed (DexJoCo metric): {succeeded}")
+    if evaluation_start and trace is not None:
+        succeeded = trace.evaluation.first_success_ns is not None
+    print(f"task={task_name} step_budget={n_steps}")
+    print(f"succeed (local task criterion): {succeeded}")
     return succeeded
 
 
 _VALUE_FLAGS = ("--record", "--shot", "--cam", "--n-steps", "--duration",
                 "--record-poses", "--playback-poses", "--grasp-class", "--pose-file",
-                "--log-grip", "--state-log", "--replay-log", "--session")
+                "--log-grip", "--state-log", "--replay-log", "--session",
+                "--evaluation-start", "--time-limit", "--operator-id", "--trial-kind", "--condition-id", "--hand",
+                "--move-rate", "--rot-rate", "--finger-slew-rate")
 
 
 def _parse(argv):
@@ -1444,7 +1710,9 @@ def _parse(argv):
     pos, flags, i = [], {}, 0
     while i < len(argv):
         a = argv[i]
-        if a in _VALUE_FLAGS and i + 1 < len(argv):
+        if a in _VALUE_FLAGS:
+            if i + 1 >= len(argv) or argv[i + 1].startswith("--"):
+                raise ValueError(f"{a} requires a value")
             flags[a] = argv[i + 1]
             i += 2
         elif a.startswith("--"):
@@ -1475,6 +1743,11 @@ if __name__ == "__main__":
         orient_only="--orient-only" in flags,
         wait_anchor="--wait-anchor" in flags,
         key_control="--key-control" in flags,
+        continuous_move="--continuous-move" in flags,
+        move_rate=float(flags.get("--move-rate", _CONTINUOUS_MOVE_RATE)),
+        rot_rate=float(flags.get("--rot-rate", _CONTINUOUS_ROT_RATE)),
+        finger_slew_rate=float(flags["--finger-slew-rate"]) if "--finger-slew-rate" in flags else
+                         (_FINGER_SLEW_RATE if "--smooth-fingers" in flags else None),
         record_poses=flags.get("--record-poses"),
         playback_poses=flags.get("--playback-poses"),
         grasp_class=flags.get("--grasp-class", _DEFAULT_GRASP_CLASS),
@@ -1486,4 +1759,10 @@ if __name__ == "__main__":
         state_log=flags.get("--state-log"),
         replay_log=flags.get("--replay-log"),
         session=flags.get("--session"),
+        evaluation_start=flags.get("--evaluation-start"),
+        time_limit=float(flags["--time-limit"]) if "--time-limit" in flags else None,
+        operator_id=flags.get("--operator-id"),
+        trial_kind=flags.get("--trial-kind", "practice"),
+        condition_id=flags.get("--condition-id"),
+        hand=flags.get("--hand", "shadow"),
     )

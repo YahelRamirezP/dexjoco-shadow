@@ -21,8 +21,16 @@ _ALLEGRO_BODIES = ("allegro_palm", "allegro_attachment",
                    "allegro_palm_right", "allegro_attachment_right")
 
 
-def build_spec(arena_name: str = "arena_arm_hand_bucket_pick.xml") -> mujoco.MjSpec:
+def build_spec(arena_name: str = "arena_arm_hand_bucket_pick.xml", hand: str = "shadow") -> mujoco.MjSpec:
+    if hand not in ("shadow", "allegro"):
+        raise ValueError(f"Unsupported hand: {hand}")
     spec = mujoco.MjSpec.from_file(os.path.join(XMLS, arena_name))
+    if hand == "allegro":
+        # Native position actuators have velocity feedback (kv=2 in bucket).
+        # Implicit velocity integration prevents explicit-Euler instability at 2 ms.
+        # Keep geometry, actuator gains and task thresholds from the native scene.
+        spec.option.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
+        return spec
 
     # remove allegro: excludes -> actuators -> sensors -> palm subtree
     for ex in list(getattr(spec, "excludes", [])):
