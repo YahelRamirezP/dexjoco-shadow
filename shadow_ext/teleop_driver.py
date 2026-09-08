@@ -855,15 +855,21 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int | None 
         pose_file: str | Path = _DEFAULT_POSE_FILE,
         measure_grip: bool = False, log_grip: str | None = None,
         slip_compensate: bool = False, float_object: bool = False,
-        state_log: str | None = None, replay_log: str | None = None):
+        state_log: str | None = None, replay_log: str | None = None,
+        session: str | None = None):
+    if session and (Path(session) / "sim").exists():
+        raise FileExistsError("Session already contains simulation data; choose a new session")
+
+    if replay_log and Path(replay_log).is_dir():
+        from .replay import render_trace
+        return render_trace(replay_log, record, cam=cam)
     task = REGISTRY[task_name]
     model = build_spec(task.arena).compile()
     data = mujoco.MjData(model)
     dt = float(model.opt.timestep)
-    # For live human teleop, the trial window is a wall-clock duration, not a
-    # step count: --n-steps overrides for the scripted/offline paths that still
-    # want a fixed step budget, but the default path derives steps from
-    # `duration` seconds so one trial = `duration` seconds of real time.
+    # Legacy budget: duration is converted into physics steps. Live processing
+    # and sleep overhead mean real elapsed time can exceed this duration.
+    # Session metadata explicitly records both clocks.
     if n_steps is None:
         n_steps = int(round(duration / dt))
 
@@ -1181,12 +1187,54 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int | None 
     # points, joints, transparency, etc.) that fire ALONGSIDE our key_callback,
     # not instead of it -- with the panels visible, WASD/IJKLUO also toggle
     # those layers on/off, confusing what's actually happening in the scene.
+    if view:
+        import importlib
+        importlib.import_module("mujoco.viewer")
     viewer = mujoco.viewer.launch_passive(
         model, data, key_callback=key_ctrl.on_key if key_ctrl is not None else None,
         show_left_ui=key_ctrl is None, show_right_ui=key_ctrl is None,
     ) if view else None
+    trace = None
+    stop_reason = "step_limit"
     try:
+        if session:
+            from .state_recording import StateTrace
+            import hashlib
+            import subprocess
+            code_root = Path(__file__).resolve().parents[1]
+            revision = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=code_root,
+                capture_output=True, text=True, check=False).stdout.strip()
+            metadata = {
+                "hand": "shadow", "task": task_name, "arena": task.arena,
+                "simulator_commit": revision, "slip_compensate": slip_compensate,
+                "float_object": float_object, "key_control": key_control,
+                "recv_fingers": recv_fingers, "recv_wrist": recv_wrist,
+                "sweep_wrist": sweep_wrist, "grasp_class": grasp_class,
+                "step_limit": n_steps, "requested_duration_s": duration,
+                "budget_clock": "simulation steps (legacy driver behavior)",
+                "success_source": "shadow_ext.tasks." + type(task).__name__ + ".update",
+                "start_definition": "Immediately before the first physics step; includes operator preparation",
+                "timestamp_semantics": "Host monotonic time after physics and task update",
+            }
+            trace = StateTrace(Path(session) / "sim", model, metadata)
+            sources = {}
+            for name in ("teleop_driver.py", "tasks.py", "build.py", "mapping.py", "state_recording.py"):
+                raw = (Path(__file__).parent / name).read_bytes()
+                (trace.directory / name).write_bytes(raw)
+                sources[name] = hashlib.sha256(raw).hexdigest()
+            for name, path in (("waypoints", playback_poses), ("initial_pose", pose_file)):
+                if path and Path(path).is_file():
+                    raw = Path(path).read_bytes()
+                    (trace.directory / (name + ".json")).write_bytes(raw)
+                    sources[name] = hashlib.sha256(raw).hexdigest()
+            trace.metadata["source_sha256"] = sources
+            trace.append(data, target_ctrl=data.ctrl[fing_ids], slip_bias=slip_bias)
+            print(f"[session] Saving full simulation states -> {trace.directory}", flush=True)
         for k in range(n_steps):
+            if viewer is not None and not viewer.is_running():
+                stop_reason = "manual_interruption"
+                break
             # Fingers: streamed retargeter qpos (flagged) or hand-tuned ramp.
             if fing_rx is not None:
                 q24 = fing_rx.latest()
@@ -1202,6 +1250,8 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int | None 
                 alpha = min(1.0, k / (n_steps / 3.0))
                 data.ctrl[fing_ids] = alpha * ctrl_close
 
+            raw_finger_target = data.ctrl[fing_ids].copy() if trace is not None else None
+            applied_slip_bias = slip_bias.copy() if trace is not None else None
             if slip_compensate:
                 data.ctrl[fing_ids] = np.clip(data.ctrl[fing_ids] + slip_bias,
                                               fing_ctrlrange[:, 0], fing_ctrlrange[:, 1])
@@ -1318,6 +1368,9 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int | None 
                     print(f"[slip] bias active: {list(zip(names, degs))}")
             just_succeeded = task.update(model, data)
             succeeded = just_succeeded or succeeded
+            if trace is not None:
+                trace.append(data, target_ctrl=raw_finger_target,
+                             slip_bias=applied_slip_bias, success=just_succeeded)
             if rec is not None and record:
                 rec.maybe_capture(data, k)
             if shot_ctrl is not None and shot_ctrl.poll_capture():
@@ -1329,9 +1382,20 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int | None 
             if live:
                 time.sleep(dt)
             if just_succeeded:
+                stop_reason = "success"
                 print(f"succeeded at t={k * dt:.1f}s (of {n_steps * dt:.0f}s budget) -> ending trial early")
                 break
+    except KeyboardInterrupt:
+        stop_reason = "manual_interruption"
+        print("[session] Interrupted; finalizing saved states.")
+    except BaseException as exc:
+        stop_reason = "technical_error"
+        if trace is not None:
+            trace.metadata["error"] = f"{type(exc).__name__}: {exc}"
+        raise
     finally:
+        if trace is not None:
+            trace.close(stop_reason)
         if viewer is not None:
             viewer.close()
         if fing_rx is not None:
@@ -1372,7 +1436,7 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int | None 
 
 _VALUE_FLAGS = ("--record", "--shot", "--cam", "--n-steps", "--duration",
                 "--record-poses", "--playback-poses", "--grasp-class", "--pose-file",
-                "--log-grip", "--state-log", "--replay-log")
+                "--log-grip", "--state-log", "--replay-log", "--session")
 
 
 def _parse(argv):
@@ -1421,4 +1485,5 @@ if __name__ == "__main__":
         float_object="--float-object" in flags,
         state_log=flags.get("--state-log"),
         replay_log=flags.get("--replay-log"),
+        session=flags.get("--session"),
     )
