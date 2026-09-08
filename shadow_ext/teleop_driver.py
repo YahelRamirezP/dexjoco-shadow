@@ -462,6 +462,41 @@ class _PosePlayback:
         return self._idx >= len(self._waypoints) - 1
 
 
+def _replay_state_log(model, data, rec, record: str | None, task, replay_log: str):
+    """Re-render a --state-log trace: pure playback, no dynamics, no pacing.
+
+    Each saved frame is a full data.qpos snapshot from a real (already-completed)
+    live run, so setting qpos + mj_forward reproduces that exact instant -- fingers,
+    arm, and object all at once, deterministically -- regardless of how the frame
+    was originally driven (webcam retargeter, keyboard, or both). This is what
+    makes it safe to record the live session with NO --record (full speed, no
+    render lag) and only pay the ~15-23x-realtime render cost afterwards, offline,
+    once per desired camera set/resolution.
+    """
+    npz = np.load(replay_log)
+    qpos_frames = npz["qpos"]
+    task.reset()
+    succeeded = False
+    t0 = time.time()
+    for k in range(qpos_frames.shape[0]):
+        data.qpos[:] = qpos_frames[k]
+        mujoco.mj_forward(model, data)
+        just_succeeded = task.update(model, data)
+        succeeded = succeeded or just_succeeded
+        if rec is not None and record:
+            rec.maybe_capture(data, k)
+    elapsed = time.time() - t0
+    print(f"[replay] {qpos_frames.shape[0]} frames from {replay_log} in {elapsed:.1f}s wall")
+    if rec is not None:
+        if record:
+            paths = rec.save_video(record)
+            print(f"video saved: {paths}")
+        rec.close()
+    print(f"task={task.name} frames={qpos_frames.shape[0]} (replay)")
+    print(f"succeed (DexJoCo metric): {succeeded}")
+    return succeeded
+
+
 class _ShotController:
     """Global spacebar listener for interactive --shot captures (fires
     regardless of window focus, same as _KeyController/_PoseRecorder). Each
@@ -819,7 +854,8 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int | None 
         grasp_class: str = _DEFAULT_GRASP_CLASS,
         pose_file: str | Path = _DEFAULT_POSE_FILE,
         measure_grip: bool = False, log_grip: str | None = None,
-        slip_compensate: bool = False, float_object: bool = False):
+        slip_compensate: bool = False, float_object: bool = False,
+        state_log: str | None = None, replay_log: str | None = None):
     task = REGISTRY[task_name]
     model = build_spec(task.arena).compile()
     data = mujoco.MjData(model)
@@ -832,6 +868,14 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int | None 
         n_steps = int(round(duration / dt))
 
     rec = Recorder(model, cam=cam) if (record or shot) else None
+
+    if replay_log:
+        # Offline re-render of a --state-log trace: no live driving, no wall-clock
+        # pacing, no receivers -- just set qpos and forward-kinematics it per logged
+        # frame, so a live take recorded once (fast, unrendered) can be re-rendered
+        # at any camera/resolution/frame-skip afterwards without the live render
+        # lag (~15-23x realtime measured 2026-09-07) ever touching the live session.
+        return _replay_state_log(model, data, rec, record, task, replay_log)
 
     panda_dof, panda_ctrl = _panda_ids(model)
     site_id = (model.site("attachment_site") or model.site("attachment_site_right")).id
@@ -1116,6 +1160,13 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int | None 
     elif shot:
         print(f"SHOT MODE: press Space anytime to save a still from every camera -> {shot}_NNN_<cam>.png")
 
+    # --state-log: full qpos every physics step, for a later offline
+    # _replay_state_log() pass. No rendering happens here, so this adds no
+    # wall-clock cost to the live drive -- the whole point is decoupling
+    # "drive it well" (fast, live) from "render it pretty" (slow, offline,
+    # see recorder.py's measured ~15-23x realtime at 720p/3-cam).
+    state_frames = [] if state_log else None
+
     task.reset()
     succeeded = False
     # Live sessions (viewer open, or a human streaming fingers/wrist over UDP)
@@ -1254,6 +1305,8 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int | None 
             data.ctrl[panda_ctrl] = tau
 
             mujoco.mj_step(model, data)
+            if state_frames is not None:
+                state_frames.append(data.qpos.copy())
             if measure_grip or float_object:
                 _grip_diagnostic(k)
             if slip_compensate:
@@ -1295,6 +1348,14 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int | None 
         if grip_log_file is not None:
             grip_log_file.close()
             print(f"[grip] slip log saved to {grip_log_path}")
+        if state_frames is not None:
+            # Inside finally: Ctrl+C during a live take must not lose the trace --
+            # that's the one thing --state-log exists to protect against (confirmed
+            # live 2026-09-07: an interrupted run silently dropped it when this save
+            # sat after the try/finally instead of in it).
+            path = _nonclobber_path(Path(state_log))
+            np.savez(path, qpos=np.array(state_frames), dt=dt, task=task_name)
+            print(f"[state-log] {len(state_frames)} frames -> {path}")
 
     if rec is not None:
         if record:
@@ -1311,7 +1372,7 @@ def run(task_name: str = "pick_bucket", view: bool = False, n_steps: int | None 
 
 _VALUE_FLAGS = ("--record", "--shot", "--cam", "--n-steps", "--duration",
                 "--record-poses", "--playback-poses", "--grasp-class", "--pose-file",
-                "--log-grip")
+                "--log-grip", "--state-log", "--replay-log")
 
 
 def _parse(argv):
@@ -1358,4 +1419,6 @@ if __name__ == "__main__":
         log_grip=flags.get("--log-grip"),
         slip_compensate="--slip-compensate" in flags,
         float_object="--float-object" in flags,
+        state_log=flags.get("--state-log"),
+        replay_log=flags.get("--replay-log"),
     )
