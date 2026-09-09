@@ -33,7 +33,15 @@ class PickBucket(_Task):
     name = "pick_bucket"
 
     def reset(self):
-        self._bottom_z0 = None
+        if not hasattr(self, '_bottom_z0'):
+            # Table-height reference: captured once, on the very first update()
+            # after the task object is created (true rest position). Evaluation
+            # restarts (F5) must not re-null this -- if the bucket is already
+            # lifted when F5 is pressed, a fresh capture would record the
+            # airborne height as "resting", corrupting every lift measurement
+            # for the rest of the trial (confirmed via trial 008 raw replay,
+            # 2026-09-09).
+            self._bottom_z0 = None
         self.metrics = None
 
     def update(self, model, data) -> bool:
