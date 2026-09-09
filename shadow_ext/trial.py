@@ -97,21 +97,28 @@ def session_summary(session):
     operator = json.loads(operator_path.read_text()) if operator_path.exists() else {}
     evaluation = sim.get('evaluation') or {}
     problems = []
+    evidence_warnings = []
     if not sim.get('complete'):
         problems.append('simulation_incomplete_or_missing')
     if not evaluation.get('started'):
-        problems.append('evaluation_not_started')
+        # The operator declares manual closures of formal trials as failures,
+        # including attempts where the F5 start marker was missed. Never infer
+        # a start timestamp or a successful outcome from these captures.
+        if sim.get('trial_kind') == 'evaluation' and sim.get('stop_reason') == 'manual_interruption':
+            evidence_warnings.append('evaluation_not_started')
+        else:
+            problems.append('evaluation_not_started')
     if sim.get('trial_kind') != 'evaluation':
         problems.append('not_an_evaluation_trial')
     if sim.get('stop_reason') not in ('success', 'time_limit', 'manual_interruption'):
         problems.append('termination_' + str(sim.get('stop_reason', 'missing')))
     if not operator.get('complete'):
-        problems.append('operator_incomplete_or_missing')
+        evidence_warnings.append('operator_incomplete_or_missing')
     if operator.get('robot') != sim.get('hand'):
-        problems.append('hand_mismatch')
+        evidence_warnings.append('hand_mismatch')
     if (not sim.get('boot_id') or operator.get('boot_id') != sim.get('boot_id')
             or operator.get('clock') != sim.get('clock')):
-        problems.append('clock_mismatch_or_unknown')
+        evidence_warnings.append('clock_mismatch_or_unknown')
     start = evaluation.get('start_monotonic_ns')
     # end_ns (last recorded physics state), not termination_monotonic_ns: the
     # latter includes post-interruption cleanup (flushing state chunks to
@@ -120,7 +127,7 @@ def session_summary(session):
     end = sim.get('end_ns', sim.get('termination_monotonic_ns'))
     if (start is None or end is None or operator.get('start_ns', math.inf) > start
             or operator.get('end_ns', -math.inf) < end - _COVERAGE_TAIL_TOLERANCE_NS):
-        problems.append('operator_does_not_cover_evaluation')
+        evidence_warnings.append('operator_does_not_cover_evaluation')
     return {
         'session_id': session.name, 'session_path': str(session),
         'operator_id': sim.get('operator_id'), 'trial_kind': sim.get('trial_kind', 'legacy'),
@@ -130,6 +137,8 @@ def session_summary(session):
         'condition_id': sim.get('condition_id'), 'stop_reason': sim.get('stop_reason'),
         'evaluation': evaluation or None,
         'eligible': not problems, 'exclusion_reasons': problems,
+        'evidence_eligible': not problems and not evidence_warnings,
+        'evidence_warnings': evidence_warnings,
         'simulation_complete': sim.get('complete', False),
         'operator_complete': operator.get('complete', False),
         'operator_frames': operator.get('frames'),
@@ -166,20 +175,28 @@ def consolidate(sessions):
     for group in groups.values():
         attempts = group.pop('attempts')
         eligible = [r for r in attempts if r['eligible']]
-        successes = [r for r in eligible if r['evaluation']['success_ever']]
+        # A manual stop is a failed attempt, even if capture metadata contains
+        # an earlier success. Camera coverage does not determine the outcome.
+        successes = [r for r in eligible if r['stop_reason'] == 'success'
+                     and r['evaluation']['success_ever']]
         times = [r['evaluation']['time_to_success_wall_s'] for r in successes]
         results.append({**group, 'sessions': [r['session_id'] for r in attempts],
                         'successful_trials': len(successes), 'evaluable_trials': len(eligible),
+                        'failed_trials': len(eligible) - len(successes),
+                        'manual_interrupted_trials': sum(r['stop_reason'] == 'manual_interruption' for r in eligible),
                         'excluded_trials': len(attempts) - len(eligible),
+                        'evidence_complete_trials': sum(r['evidence_eligible'] for r in eligible),
                         'stop_reasons': dict(Counter(r['stop_reason'] for r in attempts)),
                         'success_rate': len(successes) / len(eligible) if eligible else None,
                         'median_time_to_success_wall_s': statistics.median(times) if times else None,
                         'range_time_to_success_wall_s': [min(times), max(times)] if times else None})
-    return {'format_version': 1, 'generated_at_utc': datetime.now(timezone.utc).isoformat(),
-            'inclusion_rule': 'Completed evaluation with explicit start, a real attempted outcome '
-                              '(success, time_limit, or manual interruption -- anything else, e.g. a '
-                              'technical error, is excluded as not a valid data point), and complete '
-                              'same-hand webcam covering evaluation on the same clock',
+    return {'format_version': 2, 'generated_at_utc': datetime.now(timezone.utc).isoformat(),
+            'inclusion_rule': 'Completed formal trials ending in success, time_limit, or manual interruption. '
+                              'Success and time_limit require an explicit evaluation start. Per operator policy, '
+                              'manual interruptions count as failures even if the start marker was missed; '
+                              'no evaluation time is inferred. Technical errors and incomplete simulations '
+                              'remain excluded. Missing start markers and webcam completeness, hand/clock '
+                              'matching and coverage are reported separately as evidence warnings',
             'trials': rows, 'groups': results}
 
 

@@ -287,22 +287,24 @@ def test_consolidation_keeps_interruptions_practice_and_missing_data(tmp_path):
         consolidate([sessions[0], sessions[0]])
 
 
-def test_consolidation_rejects_wrong_hand_or_missing_camera_coverage(tmp_path):
+def test_consolidation_flags_wrong_hand_or_missing_camera_coverage(tmp_path):
     session = make_session(tmp_path / "wrong")
     op_path = session / "operator/metadata.json"
     operator = json.loads(op_path.read_text())
     operator.update(robot="allegro", start_ns=2_000_000_000)
     op_path.write_text(json.dumps(operator))
     row = session_summary(session)
-    assert "hand_mismatch" in row["exclusion_reasons"]
-    assert "operator_does_not_cover_evaluation" in row["exclusion_reasons"]
+    assert row["eligible"]
+    assert not row["evidence_eligible"]
+    assert "hand_mismatch" in row["evidence_warnings"]
+    assert "operator_does_not_cover_evaluation" in row["evidence_warnings"]
     operator.update(robot="shadow", start_ns=0)
     op_path.write_text(json.dumps(operator))
     sim_path = session / "sim/metadata.json"
     sim = json.loads(sim_path.read_text())
     sim["end_ns"] = 20_000_000_000  # past operator end_ns (5e9) by more than the tail tolerance
     sim_path.write_text(json.dumps(sim))
-    assert session_summary(session)["exclusion_reasons"] == ["operator_does_not_cover_evaluation"]
+    assert session_summary(session)["evidence_warnings"] == ["operator_does_not_cover_evaluation"]
 
 
 def test_manual_interruption_within_shutdown_tolerance_is_eligible(tmp_path):
@@ -319,10 +321,11 @@ def test_manual_interruption_within_shutdown_tolerance_is_eligible(tmp_path):
     assert row["eligible"]
     assert row["exclusion_reasons"] == []
 
-    # But a gap past the tolerance still correctly excludes it.
+    # A longer gap is an evidence warning; the failed attempt still counts.
     operator["end_ns"] = 4_000_000_000 - 6_000_000_000
     op_path.write_text(json.dumps(operator))
-    assert "operator_does_not_cover_evaluation" in session_summary(session)["exclusion_reasons"]
+    assert session_summary(session)["eligible"]
+    assert "operator_does_not_cover_evaluation" in session_summary(session)["evidence_warnings"]
 
 
 
@@ -383,3 +386,83 @@ def test_camera_provenance_freezes_loaded_local_source(tmp_path, monkeypatch):
     frozen = tmp_path / "operator/source/local_module.py"
     assert frozen.read_bytes() == source.read_bytes()
     assert camera.metadata["provenance"]["source_sha256"]["local_module.py"] == hashlib.sha256(source.read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize("camera_issue", ["early_stop", "incomplete", "missing"])
+def test_failed_interruption_stays_in_denominator_despite_camera_issue(tmp_path, camera_issue):
+    success = make_session(tmp_path / "success")
+    failure = make_session(tmp_path / "failure", reason="manual_interruption")
+    op_path = failure / "operator/metadata.json"
+    operator = json.loads(op_path.read_text())
+    if camera_issue == "missing":
+        op_path.unlink()
+    else:
+        if camera_issue == "early_stop":
+            sim_path = failure / "sim/metadata.json"
+            sim = json.loads(sim_path.read_text())
+            sim["end_ns"] = 60_000_000_000  # camera ends 55 seconds early
+            sim_path.write_text(json.dumps(sim))
+        else:
+            operator["complete"] = False
+        op_path.write_text(json.dumps(operator))
+    report = consolidate([success, failure])
+    row = report["trials"][1]
+    assert row["eligible"]
+    assert not row["evidence_eligible"]
+    assert row["evidence_warnings"]
+    group = report["groups"][0]
+    assert group["evaluable_trials"] == 2
+    assert group["successful_trials"] == 1
+    assert group["failed_trials"] == 1
+    assert group["manual_interrupted_trials"] == 1
+    assert group["excluded_trials"] == 0
+    assert group["evidence_complete_trials"] == 1
+    assert group["success_rate"] == .5
+
+
+def test_manual_stop_is_failure_even_with_raw_success(tmp_path):
+    session = make_session(tmp_path / "interrupted", reason="manual_interruption")
+    sim_path = session / "sim/metadata.json"
+    sim = json.loads(sim_path.read_text())
+    sim["evaluation"].update(success_ever=True, time_to_success_wall_s=1.0)
+    sim_path.write_text(json.dumps(sim))
+    group = consolidate([session])["groups"][0]
+    assert group["successful_trials"] == 0
+    assert group["failed_trials"] == 1
+    assert group["success_rate"] == 0
+    assert group["median_time_to_success_wall_s"] is None
+
+
+@pytest.mark.parametrize("reason,started,complete", [
+    ("technical_error", True, True),
+    ("success", False, True),
+    ("manual_interruption", True, False),
+])
+def test_camera_rule_does_not_admit_unstarted_or_technical_trials(tmp_path, reason, started, complete):
+    session = make_session(tmp_path / "excluded", reason=reason, started=started)
+    sim_path = session / "sim/metadata.json"
+    sim = json.loads(sim_path.read_text())
+    sim["complete"] = complete
+    sim_path.write_text(json.dumps(sim))
+    row = session_summary(session)
+    assert not row["eligible"]
+    assert row["exclusion_reasons"]
+
+
+@pytest.mark.parametrize("started", [True, False])
+def test_operator_declared_formal_abort_counts_as_failure_with_or_without_f5(tmp_path, started):
+    success = make_session(tmp_path / "success")
+    failure = make_session(tmp_path / "aborted", reason="manual_interruption", started=started)
+    report = consolidate([success, failure])
+    row = report["trials"][1]
+    assert row["eligible"]
+    assert row["evaluation"]["time_to_success_wall_s"] is None
+    if not started:
+        assert "evaluation_not_started" in row["evidence_warnings"]
+        assert row["evaluation"]["start_monotonic_ns"] is None
+    group = report["groups"][0]
+    assert group["success_rate"] == .5
+    assert group["evaluable_trials"] == 2
+    assert group["failed_trials"] == 1
+    assert group["manual_interrupted_trials"] == 1
+    assert group["excluded_trials"] == 0
